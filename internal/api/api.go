@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"voiceplan/internal/gcal"
+	"voiceplan/internal/line"
 	"voiceplan/internal/plan"
 )
 
@@ -54,7 +55,50 @@ type Events interface {
 	Delete(ctx context.Context, userID, id int64) error
 }
 
+// Contact is a person who can receive LINE reminders.
+type Contact struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"` // pending | active | blocked
+	IsSelf bool   `json:"is_self"`
+}
+
+type Contacts interface {
+	List(ctx context.Context, userID int64) ([]Contact, error)
+	EnsureSelf(ctx context.Context, userID int64) (Contact, error)
+	CreateBindingCode(ctx context.Context, contactID int64, codeHash []byte, expires time.Time) error
+}
+
+type ScheduleReq struct {
+	UserID      int64
+	EventID     int64
+	Start       time.Time
+	LeadMinutes int
+	ContactIDs  []int64
+	Tips        string
+	Now         time.Time
+}
+
+type ScheduleResult struct {
+	Status     string // scheduled | none | event_started
+	Recipients int
+	Late       bool
+}
+
+type Reminders interface {
+	Schedule(ctx context.Context, q ScheduleReq) (ScheduleResult, error)
+}
+
+type TipsGenerator interface {
+	Tips(ctx context.Context, ev plan.Event, now time.Time) (string, error)
+}
+
+const bindingCodeTTL = 10 * time.Minute
+
 type Server struct {
+	Contacts    Contacts
+	Reminders   Reminders
+	Tips        TipsGenerator
 	Parser      Parser
 	Transcriber Transcriber
 	Calendar    Calendar
@@ -72,6 +116,51 @@ func (s *Server) Register(mux *http.ServeMux, wrap func(http.Handler) http.Handl
 	mux.Handle("POST /api/transcribe", h(s.transcribe))
 	mux.Handle("GET /api/events", h(s.listEvents))
 	mux.Handle("DELETE /api/events/{id}", h(s.deleteEvent))
+	mux.Handle("GET /api/contacts", h(s.listContacts))
+	mux.Handle("POST /api/line/bind", h(s.startBinding))
+}
+
+func (s *Server) listContacts(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	cs, err := s.Contacts.List(r.Context(), uid)
+	if err != nil {
+		log.Printf("list contacts: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if cs == nil {
+		cs = []Contact{}
+	}
+	writeJSON(w, 200, cs)
+}
+
+// startBinding issues a one-time code for the user's own LINE account. Only the
+// hash is stored; the code is shown once.
+func (s *Server) startBinding(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	self, err := s.Contacts.EnsureSelf(r.Context(), uid)
+	if err != nil {
+		log.Printf("ensure self: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	code, hash, err := line.NewBindingCode()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if err := s.Contacts.CreateBindingCode(r.Context(), self.ID, hash, s.now().Add(bindingCodeTTL)); err != nil {
+		log.Printf("create binding code: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": code, "expires_in_minutes": int(bindingCodeTTL.Minutes())})
 }
 
 func (s *Server) now() time.Time {
@@ -137,12 +226,12 @@ func (s *Server) parse(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "text_length")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 55*time.Second)
 	defer cancel()
 	raw, err := s.Parser.ParsePlan(ctx, text, s.now())
 	if err != nil {
 		log.Printf("parse failed: %v", err) // error text carries no user content
-		writeErr(w, http.StatusBadGateway, "parse_failed")
+		writeErr(w, llmStatus(err), llmCode(err, "parse_failed"))
 		return
 	}
 	writeJSON(w, 200, plan.Normalize(raw, s.now()))
@@ -167,20 +256,56 @@ func (s *Server) transcribe(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "audio_too_short")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 55*time.Second)
 	defer cancel()
 	text, err := s.Transcriber.Transcribe(ctx, audio, "audio/wav")
 	if err != nil {
 		log.Printf("transcribe failed: %v", err)
-		writeErr(w, http.StatusBadGateway, "transcribe_failed")
+		writeErr(w, llmStatus(err), llmCode(err, "transcribe_failed"))
 		return
 	}
 	writeJSON(w, 200, map[string]string{"text": text})
 }
 
+// Busyer is implemented by errors that mean "temporarily overloaded".
+type Busyer interface{ Busy() bool }
+
+func isBusy(err error) bool {
+	var b Busyer
+	return errors.As(err, &b) && b.Busy()
+}
+
+func llmStatus(err error) int {
+	if isBusy(err) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+func llmCode(err error, fallback string) string {
+	if isBusy(err) {
+		return "llm_busy"
+	}
+	return fallback
+}
+
+// ReminderInput is optional: no lead time or no recipients means no reminder.
+type ReminderInput struct {
+	LeadMinutes int     `json:"lead_minutes"`
+	ContactIDs  []int64 `json:"contact_ids"`
+}
+
 type confirmReq struct {
 	RequestID string `json:"request_id"`
 	plan.ConfirmInput
+	Reminder *ReminderInput `json:"reminder"`
+}
+
+type confirmResp struct {
+	EventRow
+	// scheduled | none | event_started | failed
+	Reminder     string `json:"reminder,omitempty"`
+	ReminderLate bool   `json:"reminder_late,omitempty"`
 }
 
 // confirm is the only path that writes to Google Calendar, and only for an
@@ -241,7 +366,42 @@ func (s *Server) confirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	row.Status = "active"
-	writeJSON(w, http.StatusCreated, row)
+
+	resp := confirmResp{EventRow: row}
+	resp.Reminder, resp.ReminderLate = s.scheduleReminder(r.Context(), uid, row.ID, ev, in.Reminder)
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// scheduleReminder never fails the confirmation: the calendar event already
+// exists, so a reminder problem is reported to the client instead.
+func (s *Server) scheduleReminder(ctx context.Context, uid, eventID int64, ev plan.Event, in *ReminderInput) (string, bool) {
+	if in == nil || in.LeadMinutes <= 0 || len(in.ContactIDs) == 0 || s.Reminders == nil {
+		return "none", false
+	}
+	if in.LeadMinutes > 7*24*60 || len(in.ContactIDs) > 20 {
+		return "failed", false
+	}
+	now := s.now()
+	tips := ""
+	if s.Tips != nil && now.Before(ev.Start) {
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+		defer cancel()
+		t, err := s.Tips.Tips(tctx, ev, now)
+		if err != nil {
+			log.Printf("tips failed (sending reminder without): %v", err)
+		} else {
+			tips = t
+		}
+	}
+	res, err := s.Reminders.Schedule(context.WithoutCancel(ctx), ScheduleReq{
+		UserID: uid, EventID: eventID, Start: ev.Start, LeadMinutes: in.LeadMinutes,
+		ContactIDs: in.ContactIDs, Tips: tips, Now: now,
+	})
+	if err != nil {
+		log.Printf("schedule reminder: %v", err)
+		return "failed", false
+	}
+	return res.Status, res.Late
 }
 
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {

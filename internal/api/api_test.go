@@ -90,8 +90,44 @@ func (m *memEvents) Delete(_ context.Context, _ int64, id int64) error {
 	return nil
 }
 
+type fakeContacts struct {
+	list  []Contact
+	codes [][]byte
+}
+
+func (f *fakeContacts) List(context.Context, int64) ([]Contact, error) { return f.list, nil }
+func (f *fakeContacts) EnsureSelf(context.Context, int64) (Contact, error) {
+	return Contact{ID: 7, Name: "我自己", Status: "pending", IsSelf: true}, nil
+}
+func (f *fakeContacts) CreateBindingCode(_ context.Context, _ int64, h []byte, exp time.Time) error {
+	f.codes = append(f.codes, h)
+	return nil
+}
+
+type fakeReminders struct {
+	reqs []ScheduleReq
+	res  ScheduleResult
+	err  error
+}
+
+func (f *fakeReminders) Schedule(_ context.Context, q ScheduleReq) (ScheduleResult, error) {
+	f.reqs = append(f.reqs, q)
+	return f.res, f.err
+}
+
+type fakeTips struct {
+	out string
+	err error
+}
+
+func (f fakeTips) Tips(context.Context, plan.Event, time.Time) (string, error) { return f.out, f.err }
+
 func newServer(p fakeParser, cal *fakeCal, ev *memEvents, authed bool) *http.ServeMux {
-	s := &Server{Parser: p, Transcriber: fakeTr{}, Calendar: cal, Events: ev,
+	return newServerR(p, cal, ev, authed, &fakeContacts{}, &fakeReminders{res: ScheduleResult{Status: "scheduled", Recipients: 1}}, fakeTips{out: "・帶健保卡"})
+}
+
+func newServerR(p fakeParser, cal *fakeCal, ev *memEvents, authed bool, c Contacts, r Reminders, tg TipsGenerator) *http.ServeMux {
+	s := &Server{Contacts: c, Reminders: r, Tips: tg, Parser: p, Transcriber: fakeTr{}, Calendar: cal, Events: ev,
 		UserID: func(context.Context) (int64, bool) { return 1, authed },
 		Now:    func() time.Time { return fixedNow }}
 	mux := http.NewServeMux()
@@ -145,6 +181,19 @@ func TestParseValidationAndFailure(t *testing.T) {
 	}
 	if rec := do(mux, "POST", "/api/plans/parse", "application/json", map[string]string{"text": "hi"}); rec.Code != 502 {
 		t.Fatalf("llm failure: %d", rec.Code)
+	}
+}
+
+type busyErr struct{}
+
+func (busyErr) Error() string { return "busy" }
+func (busyErr) Busy() bool    { return true }
+
+func TestParseReportsBusyDistinctly(t *testing.T) {
+	mux := newServer(fakeParser{err: busyErr{}}, &fakeCal{}, newMem(), true)
+	rec := do(mux, "POST", "/api/plans/parse", "application/json", map[string]string{"text": "hi"})
+	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "llm_busy") {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -231,5 +280,102 @@ func TestUnauthenticatedUserRejected(t *testing.T) {
 	mux := newServer(fakeParser{}, &fakeCal{}, newMem(), false)
 	if rec := do(mux, "POST", "/api/plans/confirm", "application/json", validConfirm("req-12345678")); rec.Code != 401 {
 		t.Fatalf("%d", rec.Code)
+	}
+}
+
+func withReminder(req string, lead int, ids ...int64) map[string]any {
+	m := validConfirm(req)
+	m["reminder"] = map[string]any{"lead_minutes": lead, "contact_ids": ids}
+	return m
+}
+
+func TestConfirmSchedulesReminderWithTips(t *testing.T) {
+	rem := &fakeReminders{res: ScheduleResult{Status: "scheduled", Recipients: 1}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, rem, fakeTips{out: "・帶健保卡"})
+	rec := do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-12345678", 60, 7))
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"reminder":"scheduled"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if len(rem.reqs) != 1 {
+		t.Fatalf("scheduled %d times", len(rem.reqs))
+	}
+	q := rem.reqs[0]
+	if q.LeadMinutes != 60 || q.Tips != "・帶健保卡" || len(q.ContactIDs) != 1 || q.ContactIDs[0] != 7 {
+		t.Fatalf("%+v", q)
+	}
+}
+
+func TestReminderIsOptInAndNeverScheduledByRetry(t *testing.T) {
+	rem := &fakeReminders{res: ScheduleResult{Status: "scheduled"}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, rem, fakeTips{})
+	// No recipients selected (the default): nothing is scheduled.
+	do(mux, "POST", "/api/plans/confirm", "application/json", validConfirm("req-aaaaaaaa"))
+	do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-bbbbbbbb", 60))
+	do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-cccccccc", 0, 7))
+	if len(rem.reqs) != 0 {
+		t.Fatalf("reminders must be opt-in: %d scheduled", len(rem.reqs))
+	}
+	// A double-tap on a request that already succeeded does not schedule again.
+	do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-dddddddd", 60, 7))
+	do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-dddddddd", 60, 7))
+	if len(rem.reqs) != 1 {
+		t.Fatalf("retry rescheduled: %d", len(rem.reqs))
+	}
+}
+
+func TestTipsFailureStillSchedules(t *testing.T) {
+	rem := &fakeReminders{res: ScheduleResult{Status: "scheduled"}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, rem, fakeTips{err: errors.New("llm down")})
+	rec := do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-12345678", 60, 7))
+	if rec.Code != 201 || len(rem.reqs) != 1 || rem.reqs[0].Tips != "" {
+		t.Fatalf("%d %+v", rec.Code, rem.reqs)
+	}
+}
+
+func TestReminderFailureDoesNotFailConfirmation(t *testing.T) {
+	cal := &fakeCal{}
+	rem := &fakeReminders{err: errors.New("db down")}
+	mux := newServerR(fakeParser{}, cal, newMem(), true, &fakeContacts{}, rem, fakeTips{})
+	rec := do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-12345678", 60, 7))
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"reminder":"failed"`) || cal.inserts != 1 {
+		t.Fatalf("event is already in Google Calendar, so confirm must still succeed: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestLateReminderIsReported(t *testing.T) {
+	rem := &fakeReminders{res: ScheduleResult{Status: "scheduled", Late: true}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, rem, fakeTips{})
+	rec := do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-12345678", 60, 7))
+	if !strings.Contains(rec.Body.String(), `"reminder_late":true`) {
+		t.Fatalf("%s", rec.Body)
+	}
+}
+
+func TestBindingEndpointStoresOnlyAHash(t *testing.T) {
+	c := &fakeContacts{}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, c, &fakeReminders{}, nil)
+	rec := do(mux, "POST", "/api/line/bind", "", nil)
+	var out struct {
+		Code string `json:"code"`
+		Mins int    `json:"expires_in_minutes"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if rec.Code != 200 || len(out.Code) != 8 || out.Mins != 10 || len(c.codes) != 1 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if bytes.Contains(c.codes[0], []byte(out.Code)) || len(c.codes[0]) != 32 {
+		t.Fatal("the plain code must never be stored")
+	}
+	if rec := do(newServerR(fakeParser{}, &fakeCal{}, newMem(), false, c, nil, nil), "POST", "/api/line/bind", "", nil); rec.Code != 401 {
+		t.Fatalf("binding requires login: %d", rec.Code)
+	}
+}
+
+func TestListContacts(t *testing.T) {
+	c := &fakeContacts{list: []Contact{{ID: 7, Name: "我自己", Status: "active", IsSelf: true}}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, c, nil, nil)
+	rec := do(mux, "GET", "/api/contacts", "", nil)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"status":"active"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }

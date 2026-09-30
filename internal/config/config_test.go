@@ -14,6 +14,7 @@ func base() map[string]string {
 		"OAUTH_REDIRECT_URL": "https://a/auth/callback", "ALLOWED_EMAIL": "me@example.com",
 		"SESSION_SECRET": strings.Repeat("a", 32), "APP_BASE_URL": "https://a/",
 		"GEMINI_API_KEY": "gk", "LLM_MODEL": "some-model",
+		"LINE_CHANNEL_SECRET": "ls", "LINE_CHANNEL_ACCESS_TOKEN": "lt",
 		"ENCRYPTION_KEY": base64.StdEncoding.EncodeToString(make([]byte, 32)),
 	}
 }
@@ -56,6 +57,16 @@ func TestEncryptionKeyRequiredAndValidated(t *testing.T) {
 
 func TestLLMSettingsRequired(t *testing.T) {
 	for _, k := range []string{"GEMINI_API_KEY", "LLM_MODEL"} {
+		m := base()
+		delete(m, k)
+		if _, err := load(env(m)); err == nil {
+			t.Errorf("%s should be required", k)
+		}
+	}
+}
+
+func TestLINESettingsRequired(t *testing.T) {
+	for _, k := range []string{"LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN"} {
 		m := base()
 		delete(m, k)
 		if _, err := load(env(m)); err == nil {

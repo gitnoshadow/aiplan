@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { api, ApiError, CATEGORIES, ERROR_TEXT, type EventRow, type ParseResult } from './api'
+import { api, ApiError, CATEGORIES, ERROR_TEXT, LEAD_OPTIONS, type Contact, type EventRow, type ParseResult } from './api'
 import { WavRecorder } from './recorder'
 
 const props = defineProps<{ email: string; notice: string }>()
@@ -22,6 +22,62 @@ async function loadGoogle() {
   }
 }
 const showConnect = computed(() => google.loaded && (!google.connected || google.needsReauth))
+
+// ---- LINE binding ------------------------------------------------------------
+const contacts = ref<Contact[]>([])
+const contactsLoaded = ref(false)
+const lineBound = computed(() => contacts.value.some((c) => c.is_self && c.status === 'active'))
+const lineBlocked = computed(() => contacts.value.some((c) => c.is_self && c.status === 'blocked'))
+const activeContacts = computed(() => contacts.value.filter((c) => c.status === 'active'))
+const flash = ref('')
+
+async function loadContacts() {
+  try {
+    contacts.value = await api.contacts()
+  } catch {
+    /* keep previous */
+  } finally {
+    contactsLoaded.value = true
+  }
+}
+
+const bind = reactive({ code: '', active: false, busy: false, error: '' })
+let pollTimer: number | undefined
+let pollUntil = 0
+
+function stopPolling() {
+  window.clearInterval(pollTimer)
+  pollTimer = undefined
+}
+
+async function startBind() {
+  bind.busy = true
+  bind.error = ''
+  try {
+    const r = await api.bind()
+    bind.code = r.code
+    bind.active = true
+    pollUntil = Date.now() + r.expires_in_minutes * 60_000
+    stopPolling()
+    pollTimer = window.setInterval(async () => {
+      await loadContacts()
+      if (lineBound.value) {
+        stopPolling()
+        bind.active = false
+        flash.value = 'LINE 綁定成功,之後可以在確認畫面選擇要提醒你。'
+      } else if (Date.now() > pollUntil) {
+        stopPolling()
+        bind.active = false
+        bind.error = '綁定碼已過期,請重新產生。'
+      }
+    }, 3000)
+  } catch {
+    bind.error = '產生綁定碼失敗,請再試一次。'
+  } finally {
+    bind.busy = false
+  }
+}
+const prettyCode = computed(() => (bind.code ? `${bind.code.slice(0, 4)} ${bind.code.slice(4)}` : ''))
 
 // ---- Input (text + voice) --------------------------------------------------
 const text = ref('')
@@ -77,6 +133,7 @@ async function stopRecord() {
 }
 
 onBeforeUnmount(() => {
+  stopPolling()
   window.clearInterval(timer)
   recorder?.cancel()
 })
@@ -95,6 +152,8 @@ interface Draft {
 const draft = ref<Draft | null>(null)
 const requestId = ref('')
 const saving = ref(false)
+const remindLead = ref(60)
+const remindTo = ref<number[]>([]) // empty by default: sensitive plans never leak by accident
 
 const newId = () =>
   crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
@@ -118,6 +177,8 @@ async function parse() {
       ambiguities: r.ambiguities.map((a) => ({ text: a, ok: false })),
     }
     requestId.value = newId()
+    remindLead.value = 60
+    remindTo.value = []
   } catch (e) {
     showError(e)
   } finally {
@@ -137,7 +198,7 @@ async function confirm() {
   error.value = ''
   saving.value = true
   try {
-    await api.confirm({
+    const res = await api.confirm({
       request_id: requestId.value,
       title: d.title,
       start_time: `${d.start}:00+08:00`,
@@ -145,7 +206,9 @@ async function confirm() {
       location: d.location,
       notes: d.notes,
       category: d.category,
+      reminder: remindTo.value.length ? { lead_minutes: remindLead.value, contact_ids: remindTo.value } : null,
     })
+    flash.value = reminderNotice(res.reminder, res.reminder_late)
     draft.value = null
     text.value = ''
     await Promise.all([loadEvents(), loadGoogle()])
@@ -158,6 +221,19 @@ async function confirm() {
     } else showError(e)
   } finally {
     saving.value = false
+  }
+}
+
+function reminderNotice(status?: string, late?: boolean): string {
+  switch (status) {
+    case 'scheduled':
+      return late ? '已寫入行事曆。提醒時間已過,會立刻發送 LINE 通知。' : '已寫入行事曆,並排定 LINE 提醒。'
+    case 'event_started':
+      return '已寫入行事曆。行程已經開始,所以沒有設定提醒。'
+    case 'failed':
+      return '已寫入行事曆,但提醒設定失敗,這筆行程不會收到 LINE 提醒。'
+    default:
+      return '已寫入行事曆。'
   }
 }
 
@@ -195,6 +271,7 @@ const when = (iso: string) => fmt.format(new Date(iso))
 onMounted(() => {
   void loadGoogle()
   void loadEvents()
+  void loadContacts()
 })
 </script>
 
@@ -208,6 +285,26 @@ onMounted(() => {
 
     <div class="wrap">
       <p v-if="props.notice" class="banner ok" role="status">{{ props.notice }}</p>
+
+      <p v-if="flash" class="banner ok" role="status">{{ flash }}</p>
+
+      <div v-if="contactsLoaded && !lineBound" class="banner line">
+        <template v-if="lineBlocked">
+          <span>你封鎖了官方帳號,無法收到提醒。請在 LINE 解除封鎖後,重新綁定。</span>
+        </template>
+        <template v-else-if="!bind.active">
+          <span>綁定你的 LINE,行程時間到了才會提醒你。</span>
+        </template>
+        <template v-else>
+          <span>先把 LINE 官方帳號加為好友,再傳送這組綁定碼(10 分鐘內有效):</span>
+          <strong class="code" aria-live="polite">{{ prettyCode }}</strong>
+          <span class="small">綁定成功後這裡會自動更新。</span>
+        </template>
+        <p v-if="bind.error" class="err" role="alert">{{ bind.error }}</p>
+        <button v-if="!bind.active" type="button" class="link-btn" :disabled="bind.busy" @click="startBind">
+          {{ lineBlocked ? '重新綁定 LINE' : '綁定我的 LINE' }}
+        </button>
+      </div>
 
       <div v-if="showConnect" class="banner warn" role="alert">
         <span>{{ google.needsReauth ? '需重新授權 Google,授權前無法寫入行事曆。' : '還沒連結 Google 行事曆,連結後才能寫入行程。' }}</span>
@@ -291,6 +388,23 @@ onMounted(() => {
           <textarea v-model="draft.notes" rows="2" maxlength="2000" />
         </label>
 
+        <fieldset class="remind">
+          <legend>LINE 提醒</legend>
+          <template v-if="activeContacts.length">
+            <label class="field">提前多久提醒
+              <select v-model.number="remindLead">
+                <option v-for="o in LEAD_OPTIONS" :key="o.minutes" :value="o.minutes">{{ o.label }}</option>
+              </select>
+            </label>
+            <p class="small">通知誰(預設不通知任何人):</p>
+            <label v-for="c in activeContacts" :key="c.id" class="check">
+              <input v-model="remindTo" type="checkbox" :value="c.id" />
+              <span>{{ c.name }}</span>
+            </label>
+          </template>
+          <p v-else class="small">還沒有綁定 LINE,這筆行程不會有提醒。</p>
+        </fieldset>
+
         <p v-if="error" class="err" role="alert">{{ error }}</p>
         <div class="actions">
           <van-button plain round @click="cancelDraft">返回修改</van-button>
@@ -331,6 +445,13 @@ h2 { font-size: 1.05rem; margin: 28px 0 8px; }
 .banner.ok { background: color-mix(in srgb, var(--ink) 10%, transparent); }
 .banner.warn { border-left: 3px solid var(--signal); background: color-mix(in srgb, var(--signal) 10%, transparent);
   display: flex; flex-direction: column; gap: 8px; }
+.banner.line { background: color-mix(in srgb, var(--ink) 8%, transparent); display: flex; flex-direction: column; gap: 8px; }
+.code { font-size: 1.6rem; letter-spacing: 0.12em; font-variant-numeric: tabular-nums; user-select: all; }
+.small { font-size: 0.85rem; opacity: 0.7; margin: 0; }
+.remind { border: 1px solid color-mix(in srgb, var(--ink) 18%, transparent); border-radius: 10px; margin: 16px 0 0; padding: 4px 12px 10px; }
+.remind legend { font-size: 0.85rem; padding: 0 6px; }
+button.link-btn { border: 0; font: inherit; cursor: pointer; }
+button.link-btn:disabled { opacity: 0.5; }
 .link-btn { align-self: flex-start; padding: 6px 14px; border-radius: 999px; background: var(--ink); color: var(--paper);
   text-decoration: none; font-size: 0.9rem; }
 

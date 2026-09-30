@@ -20,6 +20,9 @@ type Config struct {
 	EncryptionKey      []byte // 32 bytes; encrypts stored Google refresh tokens
 	GeminiAPIKey       string
 	LLMModel           string
+	LLMFallbackModel   string // optional
+	LineChannelSecret  string
+	LineAccessToken    string
 	AppBaseURL         string
 	StaticDir          string
 }
@@ -39,12 +42,16 @@ func load(get func(string) string) (*Config, error) {
 		StaticDir:          orDefault(get("STATIC_DIR"), "web/dist"),
 		GeminiAPIKey:       get("GEMINI_API_KEY"),
 		LLMModel:           strings.TrimSpace(get("LLM_MODEL")),
+		LLMFallbackModel:   strings.TrimSpace(get("LLM_FALLBACK_MODEL")),
+		LineChannelSecret:  strings.TrimSpace(get("LINE_CHANNEL_SECRET")),
+		LineAccessToken:    strings.TrimSpace(get("LINE_CHANNEL_ACCESS_TOKEN")),
 	}
 	required := map[string]string{
 		"DATABASE_URL": c.DatabaseURL, "GOOGLE_CLIENT_ID": c.GoogleClientID,
 		"GOOGLE_CLIENT_SECRET": c.GoogleClientSecret, "OAUTH_REDIRECT_URL": c.OAuthRedirectURL,
 		"ALLOWED_EMAIL": c.AllowedEmail, "SESSION_SECRET": c.SessionSecret, "APP_BASE_URL": c.AppBaseURL,
-		"GEMINI_API_KEY": c.GeminiAPIKey, "LLM_MODEL": c.LLMModel, "ENCRYPTION_KEY": get("ENCRYPTION_KEY"),
+		"GEMINI_API_KEY": c.GeminiAPIKey, "LLM_MODEL": c.LLMModel,
+		"LINE_CHANNEL_SECRET": c.LineChannelSecret, "LINE_CHANNEL_ACCESS_TOKEN": c.LineAccessToken, "ENCRYPTION_KEY": get("ENCRYPTION_KEY"),
 	}
 	var missing []string
 	for k, v := range required {

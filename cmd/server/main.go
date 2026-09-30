@@ -18,6 +18,8 @@ import (
 	"voiceplan/internal/gcal"
 	"voiceplan/internal/gemini"
 	"voiceplan/internal/httpx"
+	"voiceplan/internal/line"
+	"voiceplan/internal/scheduler"
 )
 
 func main() {
@@ -50,7 +52,11 @@ func run() error {
 		return err
 	}
 	llm := gemini.New(cfg.GeminiAPIKey, cfg.LLMModel)
+	llm.FallbackModel = cfg.LLMFallbackModel
+	lineClient := line.NewClient(cfg.LineAccessToken)
+	contacts := data.NewContacts(pool)
 	apiSrv := &api.Server{
+		Contacts: contacts, Reminders: data.NewReminders(pool), Tips: llm,
 		Parser: llm, Transcriber: llm, Calendar: calSvc, Events: data.NewEvents(pool),
 		UserID: func(ctx context.Context) (int64, bool) {
 			u, ok := auth.UserFrom(ctx)
@@ -62,6 +68,8 @@ func run() error {
 	mux.HandleFunc("GET /healthz", httpx.Healthz(pool))
 	authH.Register(mux)
 	apiSrv.Register(mux, authH.Require)
+	// Not behind login: LINE calls this, and every request is checked by signature.
+	mux.Handle("POST /line/webhook", line.NewWebhook(cfg.LineChannelSecret, contacts, lineClient))
 	mux.HandleFunc("/api/", httpx.APINotFound)
 	mux.Handle("/", httpx.SPA(cfg.StaticDir))
 
@@ -91,6 +99,10 @@ func run() error {
 			}
 		}
 	}()
+
+	// Single app instance = single scheduler. deliveries' unique key and the
+	// LINE retry key protect against duplicates even across restarts.
+	go scheduler.New(data.NewQueue(pool), lineClient).Run(ctx)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()

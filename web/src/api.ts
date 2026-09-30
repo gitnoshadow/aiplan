@@ -20,6 +20,26 @@ export interface EventRow {
   category: string
 }
 
+export interface Contact {
+  id: number
+  name: string
+  status: 'pending' | 'active' | 'blocked'
+  is_self: boolean
+}
+
+export interface ConfirmResult extends EventRow {
+  reminder?: 'scheduled' | 'none' | 'event_started' | 'failed'
+  reminder_late?: boolean
+}
+
+export const LEAD_OPTIONS: { minutes: number; label: string }[] = [
+  { minutes: 15, label: '15 分鐘前' },
+  { minutes: 30, label: '30 分鐘前' },
+  { minutes: 60, label: '1 小時前(預設)' },
+  { minutes: 120, label: '2 小時前' },
+  { minutes: 1440, label: '1 天前' },
+]
+
 export class ApiError extends Error {
   constructor(public code: string, public status: number) {
     super(code)
@@ -48,7 +68,9 @@ const json = (method: string, data: unknown): RequestInit => ({
 export const api = {
   googleStatus: () => call<{ connected: boolean; needs_reauth: boolean }>('/api/google/status'),
   parse: (text: string) => call<ParseResult>('/api/plans/parse', json('POST', { text })),
-  confirm: (data: Record<string, unknown>) => call<EventRow>('/api/plans/confirm', json('POST', data)),
+  confirm: (data: Record<string, unknown>) => call<ConfirmResult>('/api/plans/confirm', json('POST', data)),
+  contacts: () => call<Contact[]>('/api/contacts'),
+  bind: () => call<{ code: string; expires_in_minutes: number }>('/api/line/bind', { method: 'POST' }),
   transcribe: (wav: Blob) =>
     call<{ text: string }>('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav }),
   events: () => call<EventRow[]>('/api/events'),
@@ -70,6 +92,7 @@ export const CATEGORIES: Record<string, string> = {
 }
 
 export const ERROR_TEXT: Record<string, string> = {
+  llm_busy: 'Gemini 目前太忙,已自動重試仍未成功。請過一會兒再按一次。',
   parse_failed: '解析失敗,請稍後再試,或換個說法。',
   transcribe_failed: '語音辨識失敗,請再試一次,或直接打字。',
   audio_too_short: '錄音太短,請再說一次。',

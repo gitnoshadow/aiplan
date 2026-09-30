@@ -1,6 +1,6 @@
 # 語音計畫助理
 
-Go + Vue 3 (Vant) 單一服務。階段 1:骨架與 Google 登入(單一帳號白名單)。階段 2:文字或語音輸入 → Gemini 解析 → 確認畫面 → 寫入專用 Google 行事曆。
+Go + Vue 3 (Vant) 單一服務。階段 1:骨架與 Google 登入(單一帳號白名單)。階段 2:文字或語音輸入 → Gemini 解析 → 確認畫面 → 寫入專用 Google 行事曆。階段 3:LINE 提醒(綁定、排程器、防重複發送)。
 
 ## 本機開發
 
@@ -59,3 +59,28 @@ TEST_DATABASE_URL=postgresql://... go test ./internal/auth/
 ```bash
 go test ./...   # 涵蓋時間正規化、預設時長、Gemini 請求格式、行事曆寫入與 invalid_grant、確認冪等
 ```
+
+## 階段 3 設定(LINE 提醒)
+
+1. LINE Developers Console → 你的 Messaging API 頻道:
+   - **Basic settings → Channel secret** → Railway 變數 `LINE_CHANNEL_SECRET`
+   - **Messaging API → Channel access token**(長期有效,按 Issue)→ `LINE_CHANNEL_ACCESS_TOKEN`
+2. **先部署,再填 Webhook。** 部署完成後,Messaging API 分頁 → Webhook URL 填
+   `https://<你的網域>/line/webhook` → 開啟 **Use webhook** → 按 **Verify**,應顯示 Success。
+3. 到 LINE Official Account Manager 的回應設定,**關閉自動回應訊息**(避免多耗每月 200 則額度)。
+4. 服務必須維持**單一實例**(`railway.json` 已設定 `numReplicas: 1`)。排程器在程式內每分鐘掃描。
+
+## 階段 3 驗收清單
+
+- 首頁「綁定我的 LINE」→ 出現 8 碼 → 在 LINE 官方帳號傳送該碼 → 回覆「綁定成功」,首頁提示自動消失。
+- 新增行程(例如 2 小時後),確認畫面「通知誰」預設**沒有勾選**;勾選自己、選「1 小時前」→ 確認。
+- 到時間 LINE 收到提醒(標題、時間、地點、行前注意事項),**只收到一則**。
+- 建立「30 分鐘後開始」的行程並選 1 小時前提醒 → 立刻收到,訊息末尾註明提醒時間已過。
+- 在 App 內刪除尚未提醒的行程 → 不會再收到提醒。
+- 封鎖官方帳號 → 首頁顯示封鎖提示;解除封鎖(follow)後恢復。
+- 用錯誤的綁定碼連傳 6 次 → 第 6 次起回覆「嘗試次數過多」。
+- 用 `curl` 直接 POST `/line/webhook` 且不帶簽章 → 回 401。
+
+## 資料表(階段 3 新增)
+
+`contacts`(聯絡人)、`binding_codes`(只存雜湊)、`reminder_rules`、`deliveries`(`UNIQUE(event_id, contact_id, lead_minutes)` 防重複)、`line_usage`(每月已推送則數)。

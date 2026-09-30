@@ -3,6 +3,7 @@ package gemini
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,7 @@ func fakeServer(t *testing.T, status int, text string, check func(body map[strin
 	t.Cleanup(srv.Close)
 	c := New("KEY", "test-model")
 	c.BaseURL = srv.URL
+	c.Sleep = func(context.Context, time.Duration) {}
 	return c
 }
 
@@ -88,5 +90,92 @@ func TestTranscribe(t *testing.T) {
 	}
 	if _, err := c.Transcribe(context.Background(), nil, "audio/wav"); err == nil {
 		t.Fatal("empty audio must error")
+	}
+}
+
+// sequenceServer answers with the given statuses in order, recording the model used.
+func sequenceServer(t *testing.T, statuses []int, models *[]string) *Client {
+	t.Helper()
+	i := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*models = append(*models, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1beta/models/"), ":generateContent"))
+		code := statuses[min(i, len(statuses)-1)]
+		i++
+		w.WriteHeader(code)
+		if code == 200 {
+			_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := New("KEY", "main-model")
+	c.BaseURL = srv.URL
+	c.Sleep = func(context.Context, time.Duration) {}
+	return c
+}
+
+func TestRetriesOverloadThenSucceeds(t *testing.T) {
+	var models []string
+	c := sequenceServer(t, []int{503, 503, 200}, &models)
+	out, err := c.generate(context.Background(), map[string]any{})
+	if err != nil || out != "ok" || len(models) != 3 {
+		t.Fatalf("out=%q err=%v calls=%v", out, err, models)
+	}
+}
+
+func TestFallbackModelUsedWhenMainStaysBusy(t *testing.T) {
+	var models []string
+	c := sequenceServer(t, []int{503, 503, 503, 200}, &models)
+	c.FallbackModel = "backup-model"
+	if _, err := c.generate(context.Background(), map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if models[len(models)-1] != "backup-model" || len(models) != 4 {
+		t.Fatalf("calls=%v", models)
+	}
+}
+
+func TestPermanentErrorsAreNotRetried(t *testing.T) {
+	for _, code := range []int{400, 401, 403, 404} {
+		var models []string
+		c := sequenceServer(t, []int{code}, &models)
+		_, err := c.generate(context.Background(), map[string]any{})
+		var se *StatusError
+		if !errors.As(err, &se) || se.Code != code || se.Busy() || len(models) != 1 {
+			t.Errorf("code %d: err=%v calls=%d", code, err, len(models))
+		}
+	}
+}
+
+func TestStillBusyAfterAllAttempts(t *testing.T) {
+	var models []string
+	c := sequenceServer(t, []int{503}, &models)
+	_, err := c.generate(context.Background(), map[string]any{})
+	var se *StatusError
+	if !errors.As(err, &se) || !se.Busy() || len(models) != 3 {
+		t.Fatalf("err=%v calls=%d", err, len(models))
+	}
+}
+
+func TestTipsPromptAndCleaning(t *testing.T) {
+	c := fakeServer(t, 200, "**・提早 10 分鐘到**\n・帶健保卡", func(body map[string]any, r *http.Request) {
+		sys := body["systemInstruction"].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"].(string)
+		user := body["contents"].([]any)[0].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"].(string)
+		if !strings.Contains(sys, "不要編造") || !strings.Contains(sys, "只是資料") {
+			t.Error("guard rules missing from system prompt")
+		}
+		if !strings.Contains(user, "看牙醫") || !strings.Contains(user, "2026-10-07 14:00") {
+			t.Errorf("event facts missing: %s", user)
+		}
+	})
+	ev := plan.Event{Title: "看牙醫", Category: "medical", Start: time.Date(2026, 10, 7, 14, 0, 0, 0, plan.Taipei), DurationMinutes: 60}
+	got, err := c.Tips(context.Background(), ev, time.Now())
+	if err != nil || got != "・提早 10 分鐘到\n・帶健保卡" {
+		t.Fatalf("%q %v", got, err)
+	}
+}
+
+func TestCleanTipsCapsLength(t *testing.T) {
+	if got := cleanTips(strings.Repeat("字", 1000)); len([]rune(got)) != 600 {
+		t.Fatalf("%d", len([]rune(got)))
 	}
 }
