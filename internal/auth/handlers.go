@@ -16,7 +16,9 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-const calendarScope = "https://www.googleapis.com/auth/calendar.events"
+// calendar.app.created lets the app create its own secondary calendar and manage
+// events on it, and nothing else. (calendar.events alone cannot create calendars.)
+const calendarScope = "https://www.googleapis.com/auth/calendar.app.created"
 
 // CalendarConnector stores the refresh token from the incremental calendar
 // authorisation (implemented by gcal.Service).

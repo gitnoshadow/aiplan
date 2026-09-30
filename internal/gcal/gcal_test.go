@@ -190,3 +190,13 @@ func TestConnectEncryptsToken(t *testing.T) {
 		t.Fatal("calendar should be created on connect")
 	}
 }
+
+func TestAPIErrorIncludesReasonButNotMessage(t *testing.T) {
+	err := apiErr("create calendar", 403, []byte(`{"error":{"errors":[{"reason":"insufficientPermissions","message":"secret event title"}]}}`))
+	if err.Error() != "create calendar: status 403 (insufficientPermissions)" {
+		t.Fatalf("%v", err)
+	}
+	if got := apiErr("x", 500, []byte("not json")).Error(); got != "x: status 500" {
+		t.Fatalf("%s", got)
+	}
+}

@@ -161,6 +161,23 @@ func (s *Service) do(ctx context.Context, token, method, path string, body any) 
 	return resp.StatusCode, raw, nil
 }
 
+// apiErr builds an error from a failed API response. It includes Google's
+// machine-readable reason (e.g. accessNotConfigured) but never the message,
+// which could echo event content.
+func apiErr(op string, status int, raw []byte) error {
+	var e struct {
+		Error struct {
+			Errors []struct {
+				Reason string `json:"reason"`
+			} `json:"errors"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &e) == nil && len(e.Error.Errors) > 0 && e.Error.Errors[0].Reason != "" {
+		return fmt.Errorf("%s: status %d (%s)", op, status, e.Error.Errors[0].Reason)
+	}
+	return fmt.Errorf("%s: status %d", op, status)
+}
+
 // calendarID returns the dedicated calendar, creating it on first use.
 func (s *Service) calendarID(ctx context.Context, userID int64) (string, error) {
 	token, c, err := s.accessToken(ctx, userID)
@@ -176,7 +193,7 @@ func (s *Service) calendarID(ctx context.Context, userID int64) (string, error) 
 		return "", err
 	}
 	if status != http.StatusOK {
-		return "", fmt.Errorf("create calendar: status %d", status)
+		return "", apiErr("create calendar", status, raw)
 	}
 	var cal struct {
 		ID string `json:"id"`
@@ -219,7 +236,7 @@ func (s *Service) InsertEvent(ctx context.Context, userID int64, ev plan.Event) 
 		return "", ErrReauthRequired
 	}
 	if status != http.StatusOK {
-		return "", fmt.Errorf("insert event: status %d", status)
+		return "", apiErr("insert event", status, raw)
 	}
 	var out struct {
 		ID string `json:"id"`
@@ -240,7 +257,7 @@ func (s *Service) DeleteEvent(ctx context.Context, userID int64, eventID string)
 	if err != nil {
 		return err
 	}
-	status, _, err := s.do(ctx, token, http.MethodDelete,
+	status, draw, err := s.do(ctx, token, http.MethodDelete,
 		"/calendars/"+url.PathEscape(calID)+"/events/"+url.PathEscape(eventID), nil)
 	if err != nil {
 		return err
@@ -251,5 +268,5 @@ func (s *Service) DeleteEvent(ctx context.Context, userID int64, eventID string)
 	case http.StatusUnauthorized:
 		return ErrReauthRequired
 	}
-	return fmt.Errorf("delete event: status %d", status)
+	return apiErr("delete event", status, draw)
 }
