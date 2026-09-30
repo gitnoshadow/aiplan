@@ -1,0 +1,38 @@
+:root {
+  --ink: #12303a;
+  --paper: #eef3f4;
+  --signal: #e2604d;
+  --van-primary-color: #12303a;
+  --van-background: #eef3f4;
+  --van-text-color: #12303a;
+  --van-nav-bar-background: #eef3f4;
+  --van-nav-bar-title-text-color: #12303a;
+  --van-nav-bar-icon-color: #12303a;
+  --van-button-primary-background: #12303a;
+  --van-button-primary-border-color: #12303a;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e6eef0;
+    --paper: #0f1d22;
+    --van-primary-color: #7fc6d1;
+    --van-background: #0f1d22;
+    --van-text-color: #e6eef0;
+    --van-nav-bar-background: #0f1d22;
+    --van-nav-bar-title-text-color: #e6eef0;
+    --van-nav-bar-icon-color: #e6eef0;
+    --van-button-primary-background: #e6eef0;
+    --van-button-primary-border-color: #e6eef0;
+    --van-button-primary-color: #0f1d22;
+    --van-empty-description-color: #9db3b8;
+  }
+}
+html, body, #app { height: 100%; margin: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: -apple-system, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
