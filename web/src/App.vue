@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import Home from './Home.vue'
+import VersionTag from './VersionTag.vue'
 
 type State = 'loading' | 'anon' | 'authed'
 const state = ref<State>('loading')
@@ -61,6 +62,8 @@ onMounted(() => {
     <p v-if="errorText" class="error top" role="alert">{{ errorText }}</p>
     <Home :email="email" :notice="notice" @logout="logout" />
   </template>
+
+  <VersionTag v-if="state !== 'loading'" />
 </template>
 
 <style scoped>

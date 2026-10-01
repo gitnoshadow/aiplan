@@ -55,6 +55,12 @@ export const LEAD_OPTIONS: { minutes: number; label: string }[] = [
   { minutes: 1440, label: '1 天前' },
 ]
 
+export interface SyncStatus {
+  last_synced_at: string | null
+  last_error: string
+  interval_minutes: number
+}
+
 export class ApiError extends Error {
   constructor(public code: string, public status: number) {
     super(code)
@@ -99,6 +105,8 @@ export const api = {
   bind: () => call<{ code: string; expires_in_minutes: number }>('/api/line/bind', { method: 'POST' }),
   transcribe: (wav: Blob) =>
     call<{ text: string }>('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav }),
+  syncStatus: () => call<SyncStatus>('/api/sync/status'),
+  syncNow: () => call<{ updated: number; cancelled: number; status: SyncStatus }>('/api/sync/now', { method: 'POST' }),
   events: () => call<EventRow[]>('/api/events'),
   deleteEvent: (id: number) => call<void>(`/api/events/${id}`, { method: 'DELETE' }),
 }
@@ -123,6 +131,7 @@ export const ERROR_TEXT: Record<string, string> = {
   invalid_name: '名稱需要 1 到 30 個字。',
   group_failed: '儲存分組失敗,分組名稱可能重複了。',
   cannot_delete_self: '不能刪除自己。',
+  sync_failed: '同步 Google 日曆失敗,請稍後再試。',
   parse_failed: '解析失敗,請稍後再試,或換個說法。',
   transcribe_failed: '語音辨識失敗,請再試一次,或直接打字。',
   audio_too_short: '錄音太短,請再說一次。',

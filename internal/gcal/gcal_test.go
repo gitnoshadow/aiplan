@@ -200,3 +200,112 @@ func TestAPIErrorIncludesReasonButNotMessage(t *testing.T) {
 		t.Fatalf("%s", got)
 	}
 }
+
+func listServer(t *testing.T, handler func(q map[string][]string) (int, string)) (*Service, *[]string) {
+	t.Helper()
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/token":
+			_, _ = w.Write([]byte(`{"access_token":"AT"}`))
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/events"):
+			queries = append(queries, r.URL.RawQuery)
+			code, body := handler(r.URL.Query())
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(body))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	enc, _ := crypto.Encrypt(key, []byte("RT"))
+	st := &memStore{c: &Creds{RefreshTokenEnc: enc, CalendarID: "cal-1"}}
+	s := NewService(st, key, "cid", "sec")
+	s.APIBase, s.TokenURL = srv.URL+"/cal", srv.URL+"/token"
+	return s, &queries
+}
+
+var syncNow = time.Date(2026, 10, 1, 10, 0, 0, 0, plan.Taipei)
+
+func TestFullSyncUsesTimeMinAndExpandsRecurrence(t *testing.T) {
+	s, qs := listServer(t, func(map[string][]string) (int, string) {
+		return 200, `{"items":[
+		  {"id":"a","status":"confirmed","summary":"看牙醫","location":"診所","description":"帶健保卡",
+		   "start":{"dateTime":"2026-10-07T14:00:00+08:00"},"end":{"dateTime":"2026-10-07T15:30:00+08:00"}},
+		  {"id":"b","status":"cancelled"},
+		  {"id":"c","summary":"全天","start":{"date":"2026-10-08"},"end":{"date":"2026-10-09"}}],
+		 "nextSyncToken":"TOK1"}`
+	})
+	evs, tok, err := s.ListChanges(context.Background(), 1, "", syncNow)
+	if err != nil || tok != "TOK1" || len(evs) != 3 {
+		t.Fatalf("%v %q %d", err, tok, len(evs))
+	}
+	q := (*qs)[0]
+	for _, want := range []string{"singleEvents=true", "showDeleted=true", "timeMin=2026-09-30T02%3A00%3A00Z"} {
+		if !strings.Contains(q, want) {
+			t.Errorf("query %q missing %s", q, want)
+		}
+	}
+	if strings.Contains(q, "syncToken") {
+		t.Error("a full sync must not send a syncToken")
+	}
+	a := evs[0]
+	if a.Title != "看牙醫" || a.Location != "診所" || a.Notes != "帶健保卡" || a.End.Sub(a.Start) != 90*time.Minute {
+		t.Fatalf("%+v", a)
+	}
+	if !evs[1].Cancelled || !evs[2].AllDay {
+		t.Fatalf("cancelled/all-day not detected: %+v %+v", evs[1], evs[2])
+	}
+}
+
+func TestIncrementalSyncSendsTokenAndNotTimeMin(t *testing.T) {
+	s, qs := listServer(t, func(map[string][]string) (int, string) { return 200, `{"items":[],"nextSyncToken":"TOK2"}` })
+	_, tok, err := s.ListChanges(context.Background(), 1, "TOK1", syncNow)
+	if err != nil || tok != "TOK2" {
+		t.Fatalf("%v %q", err, tok)
+	}
+	q := (*qs)[0]
+	if !strings.Contains(q, "syncToken=TOK1") || strings.Contains(q, "timeMin") {
+		t.Fatalf("%s", q)
+	}
+}
+
+func TestSyncFollowsPages(t *testing.T) {
+	s, qs := listServer(t, func(q map[string][]string) (int, string) {
+		if len(q["pageToken"]) == 0 {
+			return 200, `{"items":[{"id":"a","summary":"x","start":{"dateTime":"2026-10-07T14:00:00+08:00"},"end":{"dateTime":"2026-10-07T15:00:00+08:00"}}],"nextPageToken":"P2"}`
+		}
+		return 200, `{"items":[{"id":"b","summary":"y","start":{"dateTime":"2026-10-08T14:00:00+08:00"},"end":{"dateTime":"2026-10-08T15:00:00+08:00"}}],"nextSyncToken":"T"}`
+	})
+	evs, tok, err := s.ListChanges(context.Background(), 1, "", syncNow)
+	if err != nil || len(evs) != 2 || tok != "T" || len(*qs) != 2 {
+		t.Fatalf("%v %d %q %d", err, len(evs), tok, len(*qs))
+	}
+}
+
+func TestSyncErrorMapping(t *testing.T) {
+	for code, want := range map[int]error{410: ErrSyncTokenInvalid, 401: ErrReauthRequired} {
+		s, _ := listServer(t, func(map[string][]string) (int, string) { return code, `{}` })
+		if _, _, err := s.ListChanges(context.Background(), 1, "OLD", syncNow); !errors.Is(err, want) {
+			t.Errorf("%d: %v", code, err)
+		}
+	}
+	s, _ := listServer(t, func(map[string][]string) (int, string) {
+		return 403, `{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}`
+	})
+	if _, _, err := s.ListChanges(context.Background(), 1, "", syncNow); err == nil || !strings.Contains(err.Error(), "rateLimitExceeded") {
+		t.Fatalf("%v", err)
+	}
+	s, _ = listServer(t, func(map[string][]string) (int, string) { return 200, `{"items":[]}` })
+	if _, _, err := s.ListChanges(context.Background(), 1, "", syncNow); err == nil {
+		t.Fatal("a response without a sync token must be an error, never a silent success")
+	}
+}
+
+func TestSyncWithoutCalendarMeansNotConnected(t *testing.T) {
+	s, _ := listServer(t, func(map[string][]string) (int, string) { return 200, `{}` })
+	s.Store.(*memStore).c.CalendarID = ""
+	if _, _, err := s.ListChanges(context.Background(), 1, "", syncNow); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("%v", err)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -88,6 +89,24 @@ func TestLineLimitAndAddFriendURL(t *testing.T) {
 	}
 	for _, bad := range []string{"abc", "-1", "2.5"} {
 		m["LINE_MONTHLY_LIMIT"] = bad
+		if _, err := load(env(m)); err == nil {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+}
+
+func TestCalendarSyncInterval(t *testing.T) {
+	c, err := load(env(base()))
+	if err != nil || c.CalendarSyncEvery != 5*time.Minute {
+		t.Fatalf("default should be 5 minutes: %v %v", c.CalendarSyncEvery, err)
+	}
+	m := base()
+	m["CALENDAR_SYNC_MINUTES"] = "10"
+	if c, err := load(env(m)); err != nil || c.CalendarSyncEvery != 10*time.Minute {
+		t.Fatalf("%v %v", c.CalendarSyncEvery, err)
+	}
+	for _, bad := range []string{"0", "61", "abc", "-5"} {
+		m["CALENDAR_SYNC_MINUTES"] = bad
 		if _, err := load(env(m)); err == nil {
 			t.Errorf("%q should be rejected", bad)
 		}

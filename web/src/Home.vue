@@ -166,6 +166,8 @@ async function stopRecord() {
 }
 
 onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onVisible)
+  window.clearInterval(tickTimer)
   stopPolling()
   window.clearInterval(timer)
   recorder?.cancel()
@@ -276,6 +278,53 @@ function cancelDraft() {
   error.value = ''
 }
 
+// ---- Google Calendar sync --------------------------------------------------
+const sync = reactive({ at: null as string | null, error: '', interval: 5, busy: false, msg: '' })
+const nowTick = ref(Date.now())
+let tickTimer: number | undefined
+
+async function loadSync() {
+  try {
+    const s = await api.syncStatus()
+    sync.at = s.last_synced_at
+    sync.error = s.last_error
+    sync.interval = s.interval_minutes
+  } catch {
+    /* keep previous */
+  }
+}
+async function syncNow() {
+  sync.busy = true
+  sync.msg = ''
+  try {
+    const r = await api.syncNow()
+    sync.msg = r.updated || r.cancelled ? `已同步:${r.updated} 筆更新、${r.cancelled} 筆取消。` : '已同步,沒有變動。'
+    await Promise.all([loadEvents(), loadSync()])
+  } catch (e) {
+    if (e instanceof ApiError && e.code === 'reauth_required') google.needsReauth = true
+    else sync.msg = e instanceof ApiError && e.code === 'calendar_not_connected' ? '還沒連結 Google 行事曆。' : '同步失敗,請稍後再試。'
+  } finally {
+    sync.busy = false
+  }
+}
+const syncAgo = computed(() => {
+  if (!sync.at) return '尚未同步'
+  const m = Math.floor((nowTick.value - new Date(sync.at).getTime()) / 60000)
+  return m < 1 ? '剛剛' : m < 60 ? `${m} 分鐘前` : `${Math.floor(m / 60)} 小時前`
+})
+const syncProblem = computed(() => {
+  if (!sync.error) return ''
+  return sync.error === 'reauth_required' ? '需要重新授權 Google 才能同步。' : '上次同步失敗,系統會自動重試。'
+})
+
+// Coming back to the app (e.g. from the home screen) should show fresh data.
+function onVisible() {
+  if (document.visibilityState === 'visible') {
+    void loadEvents()
+    void loadSync()
+  }
+}
+
 // ---- Events ----------------------------------------------------------------
 const events = ref<EventRow[]>([])
 async function loadEvents() {
@@ -306,6 +355,9 @@ onMounted(() => {
   void loadGoogle()
   void loadEvents()
   void loadContacts()
+  void loadSync()
+  document.addEventListener('visibilitychange', onVisible)
+  tickTimer = window.setInterval(() => (nowTick.value = Date.now()), 30_000)
 })
 </script>
 
@@ -481,6 +533,12 @@ onMounted(() => {
       <!-- Upcoming -->
       <section class="upcoming">
         <h2>即將到來</h2>
+        <p class="small syncline">
+          與 Google 日曆同步:{{ syncAgo }}(每 {{ sync.interval }} 分鐘自動檢查)
+          <button type="button" class="t" :disabled="sync.busy" @click="syncNow">{{ sync.busy ? '同步中…' : '立即同步' }}</button>
+        </p>
+        <p v-if="sync.msg" class="small" role="status">{{ sync.msg }}</p>
+        <p v-if="syncProblem" class="err" role="alert">{{ syncProblem }}</p>
         <van-empty v-if="!events.length" description="還沒有計畫。" />
         <ul v-else>
           <li v-for="ev in events" :key="ev.id">
@@ -513,6 +571,9 @@ h2 { font-size: 1.05rem; margin: 28px 0 8px; }
 .code { font-size: 1.6rem; letter-spacing: 0.12em; font-variant-numeric: tabular-nums; user-select: all; }
 .small { font-size: 0.85rem; opacity: 0.7; margin: 0; }
 .small.over { opacity: 1; border-left: 3px solid var(--signal); padding-left: 8px; }
+.syncline { margin-bottom: 4px; }
+.t { background: none; border: 0; font: inherit; font-size: 0.85rem; color: var(--ink); text-decoration: underline; padding: 8px 6px; cursor: pointer; }
+.t:disabled { opacity: 0.5; }
 .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
 .chip { border: 1px solid color-mix(in srgb, var(--ink) 35%, transparent); background: var(--paper); color: var(--ink); border-radius: 999px; padding: 6px 14px; font: inherit; font-size: 0.9rem; cursor: pointer; }
 .chip.on { background: var(--ink); color: var(--paper); }

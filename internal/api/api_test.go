@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"voiceplan/internal/calsync"
 	"voiceplan/internal/gcal"
 	"voiceplan/internal/plan"
 )
@@ -183,8 +184,23 @@ func newServerR(p fakeParser, cal *fakeCal, ev *memEvents, authed bool, c Contac
 	return newServerFull(p, cal, ev, authed, c, r, tg, &fakeGroups{}, fakeUsage{})
 }
 
+type fakeSync struct {
+	err   error
+	calls int
+}
+
+func (f *fakeSync) Status(context.Context, int64) (calsync.Status, error) {
+	return calsync.Status{IntervalMinutes: 5}, nil
+}
+func (f *fakeSync) SyncUser(context.Context, int64) (calsync.Stats, error) {
+	f.calls++
+	return calsync.Stats{Updated: 2, Cancelled: 1}, f.err
+}
+
+var syncFake = &fakeSync{}
+
 func newServerFull(p fakeParser, cal *fakeCal, ev *memEvents, authed bool, c Contacts, r Reminders, tg TipsGenerator, g Groups, u Usage) *http.ServeMux {
-	s := &Server{Groups: g, Usage: u, MonthlyLimit: 200, AddFriendURL: "https://line.me/R/ti/p/@test", Contacts: c, Reminders: r, Tips: tg, Parser: p, Transcriber: fakeTr{}, Calendar: cal, Events: ev,
+	s := &Server{Sync: syncFake, Groups: g, Usage: u, MonthlyLimit: 200, AddFriendURL: "https://line.me/R/ti/p/@test", Contacts: c, Reminders: r, Tips: tg, Parser: p, Transcriber: fakeTr{}, Calendar: cal, Events: ev,
 		UserID: func(context.Context) (int64, bool) { return 1, authed },
 		Now:    func() time.Time { return fixedNow }}
 	mux := http.NewServeMux()
@@ -543,5 +559,31 @@ func TestConfirmReportsHowManyMessagesItWillUse(t *testing.T) {
 	rec := do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-12345678", 60, 7, 100, 101))
 	if !strings.Contains(rec.Body.String(), `"reminder_recipients":3`) {
 		t.Fatalf("%s", rec.Body)
+	}
+}
+
+func TestSyncNowAndStatus(t *testing.T) {
+	syncFake.err, syncFake.calls = nil, 0
+	mux := newServer(fakeParser{}, &fakeCal{}, newMem(), true)
+	rec := do(mux, "POST", "/api/sync/now", "", nil)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"updated":2`) || !strings.Contains(rec.Body.String(), `"cancelled":1`) || syncFake.calls != 1 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if rec := do(mux, "GET", "/api/sync/status", "", nil); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"interval_minutes":5`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestSyncNowErrorMapping(t *testing.T) {
+	mux := newServer(fakeParser{}, &fakeCal{}, newMem(), true)
+	for err, want := range map[error]int{gcal.ErrReauthRequired: 409, gcal.ErrNoCredentials: 409, errors.New("boom"): 502} {
+		syncFake.err = err
+		if rec := do(mux, "POST", "/api/sync/now", "", nil); rec.Code != want {
+			t.Errorf("%v: %d", err, rec.Code)
+		}
+	}
+	syncFake.err = nil
+	if rec := do(newServer(fakeParser{}, &fakeCal{}, newMem(), false), "POST", "/api/sync/now", "", nil); rec.Code != 401 {
+		t.Fatalf("requires login: %d", rec.Code)
 	}
 }

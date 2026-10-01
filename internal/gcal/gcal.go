@@ -24,6 +24,10 @@ const (
 	DefaultTokenURL = "https://oauth2.googleapis.com/token"
 )
 
+// ErrSyncTokenInvalid means Google no longer honours our syncToken (HTTP 410):
+// the caller must do a full resync.
+var ErrSyncTokenInvalid = errors.New("sync token invalid; full resync required")
+
 var (
 	ErrNoCredentials  = errors.New("google calendar not connected")
 	ErrReauthRequired = errors.New("google authorization expired; reauthorization required")
@@ -269,4 +273,96 @@ func (s *Service) DeleteEvent(ctx context.Context, userID int64, eventID string)
 		return ErrReauthRequired
 	}
 	return apiErr("delete event", status, draw)
+}
+
+// RemoteEvent is one event as Google reports it during a sync.
+type RemoteEvent struct {
+	ID        string
+	Cancelled bool
+	Title     string
+	Location  string
+	Notes     string
+	Start     time.Time
+	End       time.Time
+	AllDay    bool // all-day events carry dates, not times; we cannot schedule reminders for them
+}
+
+const maxSyncPages = 20
+
+// ListChanges returns what changed in the dedicated calendar since syncToken.
+// With an empty token it returns every event from 24 hours ago onwards (a full
+// sync). Recurring events are expanded into single instances. The returned
+// token must be stored only after the changes have been applied.
+func (s *Service) ListChanges(ctx context.Context, userID int64, syncToken string, now time.Time) ([]RemoteEvent, string, error) {
+	token, c, err := s.accessToken(ctx, userID)
+	if err != nil {
+		return nil, "", err
+	}
+	if c.CalendarID == "" {
+		return nil, "", ErrNoCredentials // nothing has ever been written, nothing to sync
+	}
+	base := "/calendars/" + url.PathEscape(c.CalendarID) + "/events"
+
+	var out []RemoteEvent
+	pageToken := ""
+	for page := 0; page < maxSyncPages; page++ {
+		q := url.Values{"singleEvents": {"true"}, "showDeleted": {"true"}, "maxResults": {"250"}}
+		if syncToken != "" {
+			q.Set("syncToken", syncToken)
+		} else {
+			q.Set("timeMin", now.Add(-24*time.Hour).UTC().Format(time.RFC3339))
+		}
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		status, raw, err := s.do(ctx, token, http.MethodGet, base+"?"+q.Encode(), nil)
+		if err != nil {
+			return nil, "", err
+		}
+		switch status {
+		case http.StatusOK:
+		case http.StatusGone:
+			return nil, "", ErrSyncTokenInvalid
+		case http.StatusUnauthorized:
+			return nil, "", ErrReauthRequired
+		default:
+			return nil, "", apiErr("list events", status, raw)
+		}
+		var resp struct {
+			Items []struct {
+				ID          string                          `json:"id"`
+				Status      string                          `json:"status"`
+				Summary     string                          `json:"summary"`
+				Location    string                          `json:"location"`
+				Description string                          `json:"description"`
+				Start       struct{ DateTime, Date string } `json:"start"`
+				End         struct{ DateTime, Date string } `json:"end"`
+			} `json:"items"`
+			NextPageToken string `json:"nextPageToken"`
+			NextSyncToken string `json:"nextSyncToken"`
+		}
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return nil, "", errors.New("list events: bad response")
+		}
+		for _, it := range resp.Items {
+			ev := RemoteEvent{ID: it.ID, Cancelled: it.Status == "cancelled", Title: it.Summary,
+				Location: it.Location, Notes: it.Description}
+			if it.Start.DateTime != "" {
+				ev.Start, _ = time.Parse(time.RFC3339, it.Start.DateTime)
+				ev.End, _ = time.Parse(time.RFC3339, it.End.DateTime)
+			} else if it.Start.Date != "" {
+				ev.AllDay = true
+			}
+			out = append(out, ev)
+		}
+		if resp.NextPageToken != "" {
+			pageToken = resp.NextPageToken
+			continue
+		}
+		if resp.NextSyncToken == "" {
+			return nil, "", errors.New("list events: no sync token returned")
+		}
+		return out, resp.NextSyncToken, nil
+	}
+	return nil, "", errors.New("list events: too many pages")
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"voiceplan/internal/calsync"
 	"voiceplan/internal/gcal"
 	"voiceplan/internal/line"
 	"voiceplan/internal/plan"
@@ -126,9 +127,16 @@ type TipsGenerator interface {
 	Tips(ctx context.Context, ev plan.Event, now time.Time) (string, error)
 }
 
+// Sync is the Google Calendar change sync (implemented by calsync.Syncer).
+type Sync interface {
+	Status(ctx context.Context, userID int64) (calsync.Status, error)
+	SyncUser(ctx context.Context, userID int64) (calsync.Stats, error)
+}
+
 const bindingCodeTTL = 10 * time.Minute
 
 type Server struct {
+	Sync         Sync
 	Groups       Groups
 	Usage        Usage
 	MonthlyLimit int
@@ -164,6 +172,49 @@ func (s *Server) Register(mux *http.ServeMux, wrap func(http.Handler) http.Handl
 	mux.Handle("PUT /api/groups/{id}", h(s.saveGroup))
 	mux.Handle("DELETE /api/groups/{id}", h(s.deleteGroup))
 	mux.Handle("GET /api/line/usage", h(s.usage))
+	mux.Handle("GET /api/sync/status", h(s.syncStatus))
+	mux.Handle("POST /api/sync/now", h(s.syncNow))
+}
+
+func (s *Server) syncStatus(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	st, err := s.Sync.Status(r.Context(), uid)
+	if err != nil {
+		log.Printf("sync status: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+// syncNow runs a sync immediately so the user does not have to wait for the timer.
+func (s *Server) syncNow(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	stats, err := s.Sync.SyncUser(ctx, uid)
+	switch {
+	case errors.Is(err, gcal.ErrReauthRequired):
+		writeErr(w, http.StatusConflict, "reauth_required")
+		return
+	case errors.Is(err, gcal.ErrNoCredentials):
+		writeErr(w, http.StatusConflict, "calendar_not_connected")
+		return
+	case err != nil:
+		log.Printf("sync now: %v", err)
+		writeErr(w, http.StatusBadGateway, "sync_failed")
+		return
+	}
+	st, _ := s.Sync.Status(r.Context(), uid)
+	writeJSON(w, 200, map[string]any{
+		"updated": stats.Updated, "cancelled": stats.Cancelled + stats.Reconciled, "status": st,
+	})
 }
 
 func pathID(r *http.Request) (int64, bool) {

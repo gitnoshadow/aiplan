@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -26,6 +27,7 @@ type Config struct {
 	LineAccessToken    string
 	LineMonthlyLimit   int    // free plan: 200
 	LineAddFriendURL   string // optional; used in invitations
+	CalendarSyncEvery  time.Duration
 	AppBaseURL         string
 	StaticDir          string
 }
@@ -58,6 +60,14 @@ func load(get func(string) string) (*Config, error) {
 		c.LineMonthlyLimit = n
 	}
 	c.LineAddFriendURL = strings.TrimSpace(get("LINE_ADD_FRIEND_URL"))
+	c.CalendarSyncEvery = 5 * time.Minute
+	if v := strings.TrimSpace(get("CALENDAR_SYNC_MINUTES")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 60 {
+			return nil, fmt.Errorf("CALENDAR_SYNC_MINUTES must be an integer from 1 to 60")
+		}
+		c.CalendarSyncEvery = time.Duration(n) * time.Minute
+	}
 	required := map[string]string{
 		"DATABASE_URL": c.DatabaseURL, "GOOGLE_CLIENT_ID": c.GoogleClientID,
 		"GOOGLE_CLIENT_SECRET": c.GoogleClientSecret, "OAUTH_REDIRECT_URL": c.OAuthRedirectURL,

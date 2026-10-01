@@ -5,14 +5,18 @@ RUN npm install -g pnpm
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
-RUN pnpm build
+COPY VERSION ./VERSION
+# The same VERSION file stamps both the page and the server, so they can be compared.
+RUN VITE_APP_VERSION="$(cat VERSION)" pnpm build
 
 # --- 2) backend ---
 FROM golang:1.23-alpine AS server
 WORKDIR /src
 COPY . .
 # go.sum is generated on first build; commit it after running `go mod tidy` locally.
-RUN go mod tidy && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+RUN go mod tidy && CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X voiceplan/internal/version.Version=$(cat VERSION) -X voiceplan/internal/version.BuiltAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -o /out/server ./cmd/server
 
 # --- 3) runtime ---
 FROM alpine:3.20
