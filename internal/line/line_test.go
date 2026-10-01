@@ -252,4 +252,36 @@ func TestWebhookFollowUnfollowAndIgnoresGroups(t *testing.T) {
 	}
 }
 
+func TestMulticast(t *testing.T) {
+	var path, key string
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, key = r.URL.Path, r.Header.Get("X-Line-Retry-Key")
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}))
+	defer srv.Close()
+	c := NewClient("T")
+	c.BaseURL = srv.URL
+	if err := c.Multicast(context.Background(), []string{"U1", "U2"}, "hi", "k"); err != nil {
+		t.Fatal(err)
+	}
+	if path != "/v2/bot/message/multicast" || key != "k" || len(body["to"].([]any)) != 2 {
+		t.Fatalf("%s %s %v", path, key, body)
+	}
+	if err := c.Multicast(context.Background(), nil, "hi", "k"); err == nil {
+		t.Fatal("empty recipient list must be refused before any request")
+	}
+	if err := c.Multicast(context.Background(), make([]string, MaxMulticast+1), "hi", "k"); err == nil {
+		t.Fatal("over LINE's limit must be refused")
+	}
+}
+
+func TestRecipientGoneOnlyForRecipientProblems(t *testing.T) {
+	for code, want := range map[int]bool{400: true, 403: true, 404: true, 401: false, 429: false, 500: false} {
+		if got := (&StatusError{Code: code}).RecipientGone(); got != want {
+			t.Errorf("%d: got %v want %v", code, got, want)
+		}
+	}
+}
+
 var _ = io.Discard

@@ -25,11 +25,26 @@ export interface Contact {
   name: string
   status: 'pending' | 'active' | 'blocked'
   is_self: boolean
+  enabled: boolean
+}
+
+export interface Group {
+  id: number
+  name: string
+  member_ids: number[]
+}
+
+export interface Usage {
+  month: string
+  sent: number
+  limit: number
+  level: 'ok' | 'warn' | 'critical' | 'full'
 }
 
 export interface ConfirmResult extends EventRow {
   reminder?: 'scheduled' | 'none' | 'event_started' | 'failed'
   reminder_late?: boolean
+  reminder_recipients?: number
 }
 
 export const LEAD_OPTIONS: { minutes: number; label: string }[] = [
@@ -70,6 +85,17 @@ export const api = {
   parse: (text: string) => call<ParseResult>('/api/plans/parse', json('POST', { text })),
   confirm: (data: Record<string, unknown>) => call<ConfirmResult>('/api/plans/confirm', json('POST', data)),
   contacts: () => call<Contact[]>('/api/contacts'),
+  createContact: (name: string) => call<Contact>('/api/contacts', json('POST', { name })),
+  updateContact: (id: number, patch: { name?: string; enabled?: boolean }) =>
+    call<void>(`/api/contacts/${id}`, json('PATCH', patch)),
+  deleteContact: (id: number) => call<void>(`/api/contacts/${id}`, { method: 'DELETE' }),
+  invite: (id: number) =>
+    call<{ code: string; expires_in_minutes: number; text: string }>(`/api/contacts/${id}/invite`, { method: 'POST' }),
+  groups: () => call<Group[]>('/api/groups'),
+  saveGroup: (id: number, name: string, memberIds: number[]) =>
+    call<Group>(id ? `/api/groups/${id}` : '/api/groups', json(id ? 'PUT' : 'POST', { name, member_ids: memberIds })),
+  deleteGroup: (id: number) => call<void>(`/api/groups/${id}`, { method: 'DELETE' }),
+  usage: () => call<Usage>('/api/line/usage'),
   bind: () => call<{ code: string; expires_in_minutes: number }>('/api/line/bind', { method: 'POST' }),
   transcribe: (wav: Blob) =>
     call<{ text: string }>('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav }),
@@ -93,6 +119,10 @@ export const CATEGORIES: Record<string, string> = {
 
 export const ERROR_TEXT: Record<string, string> = {
   llm_busy: 'Gemini 目前太忙,已自動重試仍未成功。請過一會兒再按一次。',
+  too_many_contacts: '聯絡人數量已達上限。',
+  invalid_name: '名稱需要 1 到 30 個字。',
+  group_failed: '儲存分組失敗,分組名稱可能重複了。',
+  cannot_delete_self: '不能刪除自己。',
   parse_failed: '解析失敗,請稍後再試,或換個說法。',
   transcribe_failed: '語音辨識失敗,請再試一次,或直接打字。',
   audio_too_short: '錄音太短,請再說一次。',

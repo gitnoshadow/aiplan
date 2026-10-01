@@ -82,3 +82,26 @@ func Format(m Message, now time.Time) string {
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
+
+// Quota levels shown in the UI.
+const (
+	QuotaOK       = "ok"
+	QuotaWarn     = "warn"     // 80% or more
+	QuotaCritical = "critical" // 95% or more
+	QuotaFull     = "full"     // no messages left
+)
+
+// QuotaLevel classifies monthly usage. limit <= 0 means "unknown/unlimited".
+func QuotaLevel(sent, limit int) string {
+	switch {
+	case limit <= 0:
+		return QuotaOK
+	case sent >= limit:
+		return QuotaFull
+	case sent*100 >= limit*95:
+		return QuotaCritical
+	case sent*100 >= limit*80:
+		return QuotaWarn
+	}
+	return QuotaOK
+}

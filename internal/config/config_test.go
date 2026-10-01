@@ -74,3 +74,22 @@ func TestLINESettingsRequired(t *testing.T) {
 		}
 	}
 }
+
+func TestLineLimitAndAddFriendURL(t *testing.T) {
+	c, err := load(env(base()))
+	if err != nil || c.LineMonthlyLimit != 200 || c.LineAddFriendURL != "" {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	m := base()
+	m["LINE_MONTHLY_LIMIT"], m["LINE_ADD_FRIEND_URL"] = "500", " https://line.me/R/ti/p/@x "
+	c, err = load(env(m))
+	if err != nil || c.LineMonthlyLimit != 500 || c.LineAddFriendURL != "https://line.me/R/ti/p/@x" {
+		t.Fatalf("%+v %v", c, err)
+	}
+	for _, bad := range []string{"abc", "-1", "2.5"} {
+		m["LINE_MONTHLY_LIMIT"] = bad
+		if _, err := load(env(m)); err == nil {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+}

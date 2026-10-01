@@ -56,6 +56,8 @@ func run() error {
 	lineClient := line.NewClient(cfg.LineAccessToken)
 	contacts := data.NewContacts(pool)
 	apiSrv := &api.Server{
+		Groups: data.NewGroups(pool), Usage: data.NewUsage(pool),
+		MonthlyLimit: cfg.LineMonthlyLimit, AddFriendURL: cfg.LineAddFriendURL,
 		Contacts: contacts, Reminders: data.NewReminders(pool), Tips: llm,
 		Parser: llm, Transcriber: llm, Calendar: calSvc, Events: data.NewEvents(pool),
 		UserID: func(ctx context.Context) (int64, bool) {
@@ -102,7 +104,9 @@ func run() error {
 
 	// Single app instance = single scheduler. deliveries' unique key and the
 	// LINE retry key protect against duplicates even across restarts.
-	go scheduler.New(data.NewQueue(pool), lineClient).Run(ctx)
+	sched := scheduler.New(data.NewQueue(pool), lineClient)
+	sched.MonthlyLimit = cfg.LineMonthlyLimit
+	go sched.Run(ctx)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()

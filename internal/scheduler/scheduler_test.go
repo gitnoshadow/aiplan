@@ -23,9 +23,11 @@ type row struct {
 }
 
 type memStore struct {
-	mu   sync.Mutex
-	rows []*row
-	sent int
+	mu          sync.Mutex
+	rows        []*row
+	sent        int
+	usage       int
+	invalidated []int64
 }
 
 func (m *memStore) Claim(_ context.Context, now time.Time, limit int) ([]Due, error) {
@@ -77,22 +79,39 @@ func (m *memStore) Retry(_ context.Context, id int64, a int, next time.Time, why
 	return nil
 }
 func (m *memStore) RecoverStuck(context.Context, time.Time) (int64, error) { return 0, nil }
+func (m *memStore) MarkContactInvalid(_ context.Context, id int64) error {
+	m.invalidated = append(m.invalidated, id)
+	return nil
+}
+func (m *memStore) MonthUsage(context.Context, string) (int, error) { return m.usage + m.sent, nil }
 
 type fakeSender struct {
-	calls []string
-	keys  []string
-	errs  []error // consumed in order; nil entries succeed
+	calls  []string
+	keys   []string
+	multis [][]string // recipients of each multicast
+	errs   []error    // consumed in order; nil entries succeed
 }
 
-func (f *fakeSender) Push(_ context.Context, to, msg, key string) error {
-	f.calls = append(f.calls, to+"|"+msg)
-	f.keys = append(f.keys, key)
+func (f *fakeSender) next() error {
 	if len(f.errs) > 0 {
 		e := f.errs[0]
 		f.errs = f.errs[1:]
 		return e
 	}
 	return nil
+}
+
+func (f *fakeSender) Push(_ context.Context, to, msg, key string) error {
+	f.calls = append(f.calls, to+"|"+msg)
+	f.keys = append(f.keys, key)
+	return f.next()
+}
+
+func (f *fakeSender) Multicast(_ context.Context, to []string, msg, key string) error {
+	f.calls = append(f.calls, "MULTI|"+msg)
+	f.keys = append(f.keys, key)
+	f.multis = append(f.multis, to)
+	return f.next()
 }
 
 func newSched(rows []*row, snd *fakeSender, now time.Time) (*Scheduler, *memStore) {
@@ -103,8 +122,8 @@ func newSched(rows []*row, snd *fakeSender, now time.Time) (*Scheduler, *memStor
 }
 
 func pending(id int64, start time.Time) *row {
-	return &row{Due: Due{ID: id, ContactID: 1, EventStart: start, Title: "看牙醫", LineUserID: "U1", ContactStatus: "active"},
-		status: "pending", next: t0.Add(-time.Minute)}
+	return &row{Due: Due{ID: id, ContactID: id, EventStart: start, Title: "看牙醫", LineUserID: "U1", ContactStatus: "active",
+		Enabled: true, IsSelf: true, Tips: "・帶健保卡", Notes: "掛號 5 號"}, status: "pending", next: t0.Add(-time.Minute)}
 }
 
 func TestSendsDueReminderOnce(t *testing.T) {
@@ -217,5 +236,146 @@ func TestRetryKeyIsStableUUIDShaped(t *testing.T) {
 	}
 	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(k) {
 		t.Fatalf("not UUID-shaped: %s", k)
+	}
+}
+
+func other(id int64, user string, start time.Time) *row {
+	r := pending(id, start)
+	r.IsSelf, r.LineUserID = false, user
+	return r
+}
+
+func TestOwnerGetsFullVersionOthersGetShortWithNotes(t *testing.T) {
+	snd := &fakeSender{}
+	start := t0.Add(time.Hour)
+	s, _ := newSched([]*row{pending(1, start), other(2, "U2", start)}, snd, t0)
+	s.Tick(context.Background())
+	if len(snd.calls) != 2 {
+		t.Fatalf("%v", snd.calls)
+	}
+	var full, short string
+	for _, c := range snd.calls {
+		if strings.HasPrefix(c, "U1|") {
+			full = c
+		}
+		if strings.HasPrefix(c, "U2|") {
+			short = c
+		}
+	}
+	if !strings.Contains(full, "行前注意事項") || !strings.Contains(full, "・帶健保卡") {
+		t.Fatalf("owner must get tips: %s", full)
+	}
+	if strings.Contains(short, "行前注意事項") || strings.Contains(short, "・帶健保卡") {
+		t.Fatalf("family must NOT get the tips: %s", short)
+	}
+	if !strings.Contains(short, "掛號 5 號") || !strings.Contains(short, "看牙醫") {
+		t.Fatalf("short version keeps title and notes: %s", short)
+	}
+}
+
+func TestSameMessageRecipientsAreCombinedIntoOneMulticast(t *testing.T) {
+	snd := &fakeSender{}
+	start := t0.Add(time.Hour)
+	s, st := newSched([]*row{other(1, "U1", start), other(2, "U2", start), other(3, "U3", start)}, snd, t0)
+	s.Tick(context.Background())
+	s.Tick(context.Background())
+	if len(snd.calls) != 1 || len(snd.multis) != 1 || len(snd.multis[0]) != 3 {
+		t.Fatalf("expected a single multicast to 3 people: %v", snd.calls)
+	}
+	for _, r := range st.rows {
+		if r.status != "sent" {
+			t.Fatalf("%+v", r)
+		}
+	}
+	if st.sent != 3 {
+		t.Fatalf("every recipient counts as one message: %d", st.sent)
+	}
+}
+
+func TestSinglePushAndMulticastUseDifferentStableKeys(t *testing.T) {
+	if RetryKey(1, 2, 3) != RetryKey(3, 1, 2) {
+		t.Fatal("the key must not depend on order")
+	}
+	if RetryKey(1, 2) == RetryKey(1, 2, 3) || RetryKey(1) == RetryKey(2) {
+		t.Fatal("different delivery sets need different keys")
+	}
+}
+
+func TestQuotaGuardStopsBeforeExceedingAndOwnerGoesFirst(t *testing.T) {
+	snd := &fakeSender{}
+	start := t0.Add(time.Hour)
+	// Two recipients with identical text would normally be one multicast; make one the owner.
+	own := pending(1, start)
+	own.Tips = "" // same rendered text as the family version
+	fam := other(2, "U2", start)
+	s, st := newSched([]*row{fam, own}, snd, t0)
+	s.MonthlyLimit = 200
+	st.usage = 199 // one message left
+	s.Tick(context.Background())
+	if st.rows[1].status != "sent" || st.rows[0].status != "failed" || st.rows[0].reason != "quota_exceeded" {
+		t.Fatalf("owner=%s family=%s/%s", st.rows[1].status, st.rows[0].status, st.rows[0].reason)
+	}
+	if len(snd.calls) != 1 || !strings.HasPrefix(snd.calls[0], "U1|") {
+		t.Fatalf("only the owner may be sent: %v", snd.calls)
+	}
+}
+
+func TestQuotaFullSendsNothing(t *testing.T) {
+	snd := &fakeSender{}
+	s, st := newSched([]*row{pending(1, t0.Add(time.Hour))}, snd, t0)
+	s.MonthlyLimit = 200
+	st.usage = 200
+	s.Tick(context.Background())
+	if len(snd.calls) != 0 || st.rows[0].reason != "quota_exceeded" {
+		t.Fatalf("%v %+v", snd.calls, st.rows[0])
+	}
+}
+
+func TestDisabledContactIsSkipped(t *testing.T) {
+	r := other(1, "U2", t0.Add(time.Hour))
+	r.Enabled = false
+	snd := &fakeSender{}
+	s, st := newSched([]*row{r}, snd, t0)
+	s.Tick(context.Background())
+	if len(snd.calls) != 0 || st.rows[0].status != "skipped" || st.rows[0].reason != "contact_disabled" {
+		t.Fatalf("%+v", st.rows[0])
+	}
+}
+
+func TestBlockedRecipientFlagsContactButBadTokenDoesNot(t *testing.T) {
+	snd := &fakeSender{errs: []error{&line.StatusError{Code: 403}}}
+	s, st := newSched([]*row{pending(7, t0.Add(time.Hour))}, snd, t0)
+	s.Tick(context.Background())
+	if len(st.invalidated) != 1 || st.invalidated[0] != 7 || st.rows[0].status != "failed" {
+		t.Fatalf("a recipient problem must flag the contact: %v %s", st.invalidated, st.rows[0].status)
+	}
+	// 401 = our channel token is wrong. Flagging everybody as blocked would be a disaster.
+	snd = &fakeSender{errs: []error{&line.StatusError{Code: 401}}}
+	s, st = newSched([]*row{pending(8, t0.Add(time.Hour))}, snd, t0)
+	s.Tick(context.Background())
+	if len(st.invalidated) != 0 || st.rows[0].status != "failed" {
+		t.Fatalf("401 must not flag the contact: %v", st.invalidated)
+	}
+}
+
+func TestMulticastFailureDoesNotBlameAnyone(t *testing.T) {
+	snd := &fakeSender{errs: []error{&line.StatusError{Code: 400}}}
+	start := t0.Add(time.Hour)
+	s, st := newSched([]*row{other(1, "U1", start), other(2, "U2", start)}, snd, t0)
+	s.Tick(context.Background())
+	if len(st.invalidated) != 0 {
+		t.Fatalf("cannot tell which recipient failed in a multicast: %v", st.invalidated)
+	}
+}
+
+func TestMulticastTransientFailureRetriesEveryone(t *testing.T) {
+	snd := &fakeSender{errs: []error{&line.StatusError{Code: 503}}}
+	start := t0.Add(5 * time.Hour)
+	s, st := newSched([]*row{other(1, "U1", start), other(2, "U2", start)}, snd, t0)
+	s.Tick(context.Background())
+	for _, r := range st.rows {
+		if r.status != "pending" || r.Attempts != 1 || !r.next.Equal(t0.Add(time.Minute)) {
+			t.Fatalf("%+v", r)
+		}
 	}
 }

@@ -9,8 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
+	"voiceplan/internal/line"
+	"voiceplan/internal/plan"
 	"voiceplan/internal/remind"
 )
 
@@ -27,6 +32,8 @@ type Due struct {
 	Tips          string
 	LineUserID    string
 	ContactStatus string // pending | active | blocked
+	Enabled       bool   // false = the owner paused this contact
+	IsSelf        bool   // the owner gets the full version; everyone else the short one
 }
 
 type Store interface {
@@ -38,19 +45,26 @@ type Store interface {
 	Retry(ctx context.Context, id int64, attempts int, next time.Time, reason string) error
 	// RecoverStuck returns deliveries stuck in "sending" (crash mid-send) to pending.
 	RecoverStuck(ctx context.Context, olderThan time.Time) (int64, error)
+	// MarkContactInvalid flags a contact whose LINE account can no longer receive messages.
+	MarkContactInvalid(ctx context.Context, contactID int64) error
+	// MonthUsage returns messages pushed so far in a Taipei month ("2026-10").
+	MonthUsage(ctx context.Context, month string) (int, error)
 }
 
 type Sender interface {
 	Push(ctx context.Context, to, msg, retryKey string) error
+	Multicast(ctx context.Context, to []string, msg, retryKey string) error
 }
 
 type permanent interface{ Permanent() bool }
+type recipientGone interface{ RecipientGone() bool }
 
 type Scheduler struct {
-	Store    Store
-	Sender   Sender
-	Interval time.Duration
-	Now      func() time.Time
+	Store        Store
+	Sender       Sender
+	Interval     time.Duration
+	Now          func() time.Time
+	MonthlyLimit int // 0 = do not enforce
 }
 
 func New(store Store, sender Sender) *Scheduler {
@@ -89,43 +103,128 @@ func (s *Scheduler) Tick(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
-		for _, d := range batch {
-			s.process(ctx, d, now)
-		}
+		s.processBatch(ctx, batch, now)
 	}
 }
 
-func (s *Scheduler) process(ctx context.Context, d Due, now time.Time) {
-	// A reminder for an event that already started is noise: skip and record it.
-	if !now.Before(d.EventStart) {
-		s.log("skip", s.Store.MarkSkipped(ctx, d.ID, "event_started"))
-		return
-	}
-	if d.ContactStatus != "active" || d.LineUserID == "" {
-		s.log("fail", s.Store.MarkFailed(ctx, d.ID, d.Attempts, "contact_inactive"))
-		return
-	}
-	msg := remind.Format(remind.Message{
-		Title: d.Title, Location: d.Location, Notes: d.Notes, Tips: d.Tips, Start: d.EventStart, Late: d.Late,
-	}, now)
+type group struct {
+	text string
+	ds   []Due
+}
 
-	err := s.Sender.Push(ctx, d.LineUserID, msg, RetryKey(d.ID))
+func (s *Scheduler) processBatch(ctx context.Context, batch []Due, now time.Time) {
+	var groups []*group
+	byText := map[string]*group{}
+
+	for _, d := range batch {
+		switch {
+		case !now.Before(d.EventStart): // already started: a reminder now is just noise
+			s.log("skip", s.Store.MarkSkipped(ctx, d.ID, "event_started"))
+			continue
+		case !d.Enabled:
+			s.log("skip", s.Store.MarkSkipped(ctx, d.ID, "contact_disabled"))
+			continue
+		case d.ContactStatus != "active" || d.LineUserID == "":
+			s.log("fail", s.Store.MarkFailed(ctx, d.ID, d.Attempts, "contact_inactive"))
+			continue
+		}
+		text := Render(d, now)
+		g := byText[text]
+		if g == nil {
+			g = &group{text: text}
+			byText[text] = g
+			groups = append(groups, g)
+		}
+		g.ds = append(g.ds, d)
+	}
+	for _, g := range groups {
+		s.sendGroup(ctx, g, now)
+	}
+}
+
+// Render builds the message for one recipient. The owner gets the full version
+// (with the pre-event tips); everyone else gets the short one.
+func Render(d Due, now time.Time) string {
+	m := remind.Message{Title: d.Title, Location: d.Location, Notes: d.Notes, Start: d.EventStart, Late: d.Late}
+	if d.IsSelf {
+		m.Tips = d.Tips
+	}
+	return remind.Format(m, now)
+}
+
+func (s *Scheduler) sendGroup(ctx context.Context, g *group, now time.Time) {
+	ds := g.ds
+	// Owner first, so a nearly-empty quota is spent on the person who set it up.
+	sort.SliceStable(ds, func(i, j int) bool { return ds[i].IsSelf && !ds[j].IsSelf })
+
+	if s.MonthlyLimit > 0 {
+		used, err := s.Store.MonthUsage(ctx, now.In(plan.Taipei).Format("2006-01"))
+		if err != nil {
+			log.Printf("scheduler: month usage: %v", err) // fail open: better a reminder than none
+		} else {
+			remaining := s.MonthlyLimit - used
+			if remaining < 0 {
+				remaining = 0
+			}
+			if remaining < len(ds) {
+				for _, d := range ds[remaining:] {
+					s.log("fail", s.Store.MarkFailed(ctx, d.ID, d.Attempts, "quota_exceeded"))
+				}
+				ds = ds[:remaining]
+			}
+		}
+	}
+	for len(ds) > 0 {
+		n := len(ds)
+		if n > line.MaxMulticast {
+			n = line.MaxMulticast
+		}
+		s.send(ctx, ds[:n], g.text, now)
+		ds = ds[n:]
+	}
+}
+
+func (s *Scheduler) send(ctx context.Context, ds []Due, text string, now time.Time) {
+	ids := make([]int64, len(ds))
+	to := make([]string, len(ds))
+	for i, d := range ds {
+		ids[i], to[i] = d.ID, d.LineUserID
+	}
+	var err error
+	if len(ds) == 1 {
+		err = s.Sender.Push(ctx, to[0], text, RetryKey(ids...))
+	} else {
+		err = s.Sender.Multicast(ctx, to, text, RetryKey(ids...))
+	}
 	if err == nil {
-		s.log("sent", s.Store.MarkSent(ctx, d.ID, now))
+		for _, d := range ds {
+			s.log("sent", s.Store.MarkSent(ctx, d.ID, now))
+		}
 		return
 	}
-	attempts := d.Attempts + 1
+
 	reason := errReason(err)
-	var p permanent
-	if errors.As(err, &p) && p.Permanent() {
-		s.log("fail", s.Store.MarkFailed(ctx, d.ID, attempts, reason))
-		return
+	var perm permanent
+	isPerm := errors.As(err, &perm) && perm.Permanent()
+	if isPerm && len(ds) == 1 {
+		// With one recipient we know whose fault it is. With a multicast we cannot tell.
+		var gone recipientGone
+		if errors.As(err, &gone) && gone.RecipientGone() {
+			s.log("invalidate", s.Store.MarkContactInvalid(ctx, ds[0].ContactID))
+		}
 	}
-	if next, ok := remind.NextAttempt(attempts, now); ok {
-		s.log("retry", s.Store.Retry(ctx, d.ID, attempts, next, reason))
-		return
+	for _, d := range ds {
+		attempts := d.Attempts + 1
+		if isPerm {
+			s.log("fail", s.Store.MarkFailed(ctx, d.ID, attempts, reason))
+			continue
+		}
+		if next, ok := remind.NextAttempt(attempts, now); ok {
+			s.log("retry", s.Store.Retry(ctx, d.ID, attempts, next, reason))
+		} else {
+			s.log("fail", s.Store.MarkFailed(ctx, d.ID, attempts, reason))
+		}
 	}
-	s.log("fail", s.Store.MarkFailed(ctx, d.ID, attempts, reason))
 }
 
 func (s *Scheduler) log(what string, err error) {
@@ -143,10 +242,16 @@ func errReason(err error) string {
 	return "send_failed"
 }
 
-// RetryKey is a stable UUID-shaped key per delivery, so a retry after a crash
-// between "LINE accepted" and "we recorded it" cannot deliver twice.
-func RetryKey(deliveryID int64) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("vpa-delivery-%d", deliveryID)))
+// RetryKey is a stable UUID-shaped key for a set of deliveries, so a retry after
+// a crash between "LINE accepted" and "we recorded it" cannot deliver twice.
+func RetryKey(deliveryIDs ...int64) string {
+	ids := append([]int64(nil), deliveryIDs...)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	h := sha256.Sum256([]byte("vpa-delivery-" + strings.Join(parts, "-")))
 	b := h[:16]
 	b[6] = b[6]&0x0f | 0x40
 	b[8] = b[8]&0x3f | 0x80

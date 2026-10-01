@@ -41,6 +41,16 @@ func (e *StatusError) Permanent() bool {
 	return e.Code >= 400 && e.Code < 500 && e.Code != http.StatusRequestTimeout && e.Code != http.StatusTooManyRequests
 }
 
+// RecipientGone is true when the error most likely means this person can no
+// longer receive messages (blocked the account, unfriended). 401/429 never count:
+// those are our token or our quota, not the recipient.
+func (e *StatusError) RecipientGone() bool {
+	return e.Code == http.StatusBadRequest || e.Code == http.StatusForbidden || e.Code == http.StatusNotFound
+}
+
+// MaxMulticast is LINE's limit of recipients per multicast request.
+const MaxMulticast = 500
+
 type Client struct {
 	Token   string
 	BaseURL string
@@ -94,6 +104,15 @@ func text(s string) []textMessage {
 // Push sends one text message. The same retryKey never produces a duplicate.
 func (c *Client) Push(ctx context.Context, to, msg, retryKey string) error {
 	return c.post(ctx, "/v2/bot/message/push", map[string]any{"to": to, "messages": text(msg)}, retryKey)
+}
+
+// Multicast sends the same text to several users in one request. Each
+// recipient still counts as one message against the monthly quota.
+func (c *Client) Multicast(ctx context.Context, to []string, msg, retryKey string) error {
+	if len(to) == 0 || len(to) > MaxMulticast {
+		return fmt.Errorf("line: multicast needs 1-%d recipients, got %d", MaxMulticast, len(to))
+	}
+	return c.post(ctx, "/v2/bot/message/multicast", map[string]any{"to": to, "messages": text(msg)}, retryKey)
 }
 
 // Reply answers a webhook event; replies do not use the monthly push quota.

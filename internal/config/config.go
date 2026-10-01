@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +24,8 @@ type Config struct {
 	LLMFallbackModel   string // optional
 	LineChannelSecret  string
 	LineAccessToken    string
+	LineMonthlyLimit   int    // free plan: 200
+	LineAddFriendURL   string // optional; used in invitations
 	AppBaseURL         string
 	StaticDir          string
 }
@@ -46,6 +49,15 @@ func load(get func(string) string) (*Config, error) {
 		LineChannelSecret:  strings.TrimSpace(get("LINE_CHANNEL_SECRET")),
 		LineAccessToken:    strings.TrimSpace(get("LINE_CHANNEL_ACCESS_TOKEN")),
 	}
+	c.LineMonthlyLimit = 200
+	if v := strings.TrimSpace(get("LINE_MONTHLY_LIMIT")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("LINE_MONTHLY_LIMIT must be a non-negative integer (0 = do not enforce)")
+		}
+		c.LineMonthlyLimit = n
+	}
+	c.LineAddFriendURL = strings.TrimSpace(get("LINE_ADD_FRIEND_URL"))
 	required := map[string]string{
 		"DATABASE_URL": c.DatabaseURL, "GOOGLE_CLIENT_ID": c.GoogleClientID,
 		"GOOGLE_CLIENT_SECRET": c.GoogleClientSecret, "OAUTH_REDIRECT_URL": c.OAuthRedirectURL,

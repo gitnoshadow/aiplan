@@ -91,18 +91,71 @@ func (m *memEvents) Delete(_ context.Context, _ int64, id int64) error {
 }
 
 type fakeContacts struct {
-	list  []Contact
-	codes [][]byte
+	list    []Contact
+	codes   [][]byte
+	deleted []int64
+	updated map[int64]string
 }
 
 func (f *fakeContacts) List(context.Context, int64) ([]Contact, error) { return f.list, nil }
 func (f *fakeContacts) EnsureSelf(context.Context, int64) (Contact, error) {
-	return Contact{ID: 7, Name: "我自己", Status: "pending", IsSelf: true}, nil
+	return Contact{ID: 7, Name: "我自己", Status: "pending", IsSelf: true, Enabled: true}, nil
+}
+func (f *fakeContacts) Get(_ context.Context, _ int64, id int64) (Contact, error) {
+	if id == 7 {
+		return Contact{ID: 7, Name: "我自己", IsSelf: true, Enabled: true}, nil
+	}
+	for _, c := range f.list {
+		if c.ID == id {
+			return c, nil
+		}
+	}
+	return Contact{}, ErrNotFound
+}
+func (f *fakeContacts) Create(_ context.Context, _ int64, name string) (Contact, error) {
+	c := Contact{ID: int64(100 + len(f.list)), Name: name, Status: "pending", Enabled: true}
+	f.list = append(f.list, c)
+	return c, nil
+}
+func (f *fakeContacts) Update(_ context.Context, _ int64, id int64, name *string, _ *bool) error {
+	if _, err := f.Get(context.Background(), 1, id); err != nil {
+		return err
+	}
+	if f.updated == nil {
+		f.updated = map[int64]string{}
+	}
+	if name != nil {
+		f.updated[id] = *name
+	}
+	return nil
+}
+func (f *fakeContacts) Delete(_ context.Context, _ int64, id int64) error {
+	f.deleted = append(f.deleted, id)
+	return nil
 }
 func (f *fakeContacts) CreateBindingCode(_ context.Context, _ int64, h []byte, exp time.Time) error {
 	f.codes = append(f.codes, h)
 	return nil
 }
+
+type fakeGroups struct {
+	saved []Group
+}
+
+func (f *fakeGroups) List(context.Context, int64) ([]Group, error) { return f.saved, nil }
+func (f *fakeGroups) Save(_ context.Context, _ int64, id int64, name string, m []int64) (Group, error) {
+	g := Group{ID: id, Name: name, MemberIDs: m}
+	if id == 0 {
+		g.ID = int64(len(f.saved) + 1)
+	}
+	f.saved = append(f.saved, g)
+	return g, nil
+}
+func (f *fakeGroups) Delete(context.Context, int64, int64) error { return nil }
+
+type fakeUsage struct{ n int }
+
+func (f fakeUsage) Month(context.Context, string) (int, error) { return f.n, nil }
 
 type fakeReminders struct {
 	reqs []ScheduleReq
@@ -127,7 +180,11 @@ func newServer(p fakeParser, cal *fakeCal, ev *memEvents, authed bool) *http.Ser
 }
 
 func newServerR(p fakeParser, cal *fakeCal, ev *memEvents, authed bool, c Contacts, r Reminders, tg TipsGenerator) *http.ServeMux {
-	s := &Server{Contacts: c, Reminders: r, Tips: tg, Parser: p, Transcriber: fakeTr{}, Calendar: cal, Events: ev,
+	return newServerFull(p, cal, ev, authed, c, r, tg, &fakeGroups{}, fakeUsage{})
+}
+
+func newServerFull(p fakeParser, cal *fakeCal, ev *memEvents, authed bool, c Contacts, r Reminders, tg TipsGenerator, g Groups, u Usage) *http.ServeMux {
+	s := &Server{Groups: g, Usage: u, MonthlyLimit: 200, AddFriendURL: "https://line.me/R/ti/p/@test", Contacts: c, Reminders: r, Tips: tg, Parser: p, Transcriber: fakeTr{}, Calendar: cal, Events: ev,
 		UserID: func(context.Context) (int64, bool) { return 1, authed },
 		Now:    func() time.Time { return fixedNow }}
 	mux := http.NewServeMux()
@@ -377,5 +434,114 @@ func TestListContacts(t *testing.T) {
 	rec := do(mux, "GET", "/api/contacts", "", nil)
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"status":"active"`) {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestCreateRenameDeleteContact(t *testing.T) {
+	c := &fakeContacts{}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, c, nil, nil)
+	rec := do(mux, "POST", "/api/contacts", "application/json", map[string]string{"name": " 媽媽 "})
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"name":"媽媽"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if rec := do(mux, "POST", "/api/contacts", "application/json", map[string]string{"name": "  "}); rec.Code != 400 {
+		t.Fatalf("blank name: %d", rec.Code)
+	}
+	if rec := do(mux, "POST", "/api/contacts", "application/json", map[string]string{"name": strings.Repeat("字", 31)}); rec.Code != 400 {
+		t.Fatalf("long name: %d", rec.Code)
+	}
+	if rec := do(mux, "PATCH", "/api/contacts/100", "application/json", map[string]any{"name": "老媽", "enabled": false}); rec.Code != 204 || c.updated[100] != "老媽" {
+		t.Fatalf("%d %v", rec.Code, c.updated)
+	}
+	if rec := do(mux, "PATCH", "/api/contacts/999", "application/json", map[string]any{"name": "x"}); rec.Code != 404 {
+		t.Fatalf("someone else's contact: %d", rec.Code)
+	}
+	if rec := do(mux, "DELETE", "/api/contacts/100", "", nil); rec.Code != 204 || len(c.deleted) != 1 {
+		t.Fatalf("%d %v", rec.Code, c.deleted)
+	}
+}
+
+func TestCannotDeleteSelfOrForeignContact(t *testing.T) {
+	c := &fakeContacts{}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, c, nil, nil)
+	if rec := do(mux, "DELETE", "/api/contacts/7", "", nil); rec.Code != 409 || len(c.deleted) != 0 {
+		t.Fatalf("self: %d", rec.Code)
+	}
+	if rec := do(mux, "DELETE", "/api/contacts/999", "", nil); rec.Code != 404 || len(c.deleted) != 0 {
+		t.Fatalf("foreign: %d", rec.Code)
+	}
+}
+
+func TestContactLimit(t *testing.T) {
+	c := &fakeContacts{list: make([]Contact, maxContacts)}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, c, nil, nil)
+	if rec := do(mux, "POST", "/api/contacts", "application/json", map[string]string{"name": "x"}); rec.Code != 409 {
+		t.Fatalf("%d", rec.Code)
+	}
+}
+
+func TestInviteContainsLinkAndCodeAndStoresOnlyHash(t *testing.T) {
+	c := &fakeContacts{list: []Contact{{ID: 100, Name: "媽媽", Enabled: true}}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, c, nil, nil)
+	rec := do(mux, "POST", "/api/contacts/100/invite", "", nil)
+	var out struct {
+		Code, Text string
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if rec.Code != 200 || len(out.Code) != 8 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(out.Text, "https://line.me/R/ti/p/@test") || !strings.Contains(out.Text, out.Code) {
+		t.Fatalf("invite text incomplete: %s", out.Text)
+	}
+	if len(c.codes) != 1 || bytes.Contains(c.codes[0], []byte(out.Code)) {
+		t.Fatal("plain code must not be stored")
+	}
+	if rec := do(mux, "POST", "/api/contacts/999/invite", "", nil); rec.Code != 404 {
+		t.Fatalf("foreign contact: %d", rec.Code)
+	}
+}
+
+func TestInviteTextWithoutLinkStillUsable(t *testing.T) {
+	got := InviteText("", "ABCDEFGH", 10)
+	if !strings.Contains(got, "ABCDEFGH") || strings.Contains(got, "http") {
+		t.Fatalf("%s", got)
+	}
+}
+
+func TestGroups(t *testing.T) {
+	g := &fakeGroups{}
+	mux := newServerFull(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, nil, nil, g, fakeUsage{})
+	rec := do(mux, "POST", "/api/groups", "application/json", map[string]any{"name": "家人", "member_ids": []int64{7, 100}})
+	if rec.Code != 200 || len(g.saved) != 1 || len(g.saved[0].MemberIDs) != 2 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if rec := do(mux, "PUT", "/api/groups/1", "application/json", map[string]any{"name": "全家", "member_ids": []int64{7}}); rec.Code != 200 {
+		t.Fatalf("%d", rec.Code)
+	}
+	if rec := do(mux, "POST", "/api/groups", "application/json", map[string]any{"name": " ", "member_ids": []int64{}}); rec.Code != 400 {
+		t.Fatalf("%d", rec.Code)
+	}
+	if rec := do(mux, "DELETE", "/api/groups/1", "", nil); rec.Code != 204 {
+		t.Fatalf("%d", rec.Code)
+	}
+}
+
+func TestUsageLevels(t *testing.T) {
+	for n, want := range map[int]string{10: "ok", 165: "warn", 195: "critical", 200: "full"} {
+		mux := newServerFull(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, nil, nil, &fakeGroups{}, fakeUsage{n: n})
+		rec := do(mux, "GET", "/api/line/usage", "", nil)
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"level":"`+want+`"`) || !strings.Contains(rec.Body.String(), `"month":"2026-09"`) {
+			t.Errorf("sent=%d: %d %s", n, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestConfirmReportsHowManyMessagesItWillUse(t *testing.T) {
+	rem := &fakeReminders{res: ScheduleResult{Status: "scheduled", Recipients: 3}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, rem, fakeTips{})
+	rec := do(mux, "POST", "/api/plans/confirm", "application/json", withReminder("req-12345678", 60, 7, 100, 101))
+	if !strings.Contains(rec.Body.String(), `"reminder_recipients":3`) {
+		t.Fatalf("%s", rec.Body)
 	}
 }

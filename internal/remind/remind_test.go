@@ -78,3 +78,19 @@ func TestFormatMinimalAndLate(t *testing.T) {
 		t.Fatalf("%s", far)
 	}
 }
+
+func TestQuotaLevel(t *testing.T) {
+	cases := []struct {
+		sent, limit int
+		want        string
+	}{
+		{0, 200, QuotaOK}, {159, 200, QuotaOK}, {160, 200, QuotaWarn}, {189, 200, QuotaWarn},
+		{190, 200, QuotaCritical}, {199, 200, QuotaCritical}, {200, 200, QuotaFull}, {250, 200, QuotaFull},
+		{500, 0, QuotaOK},
+	}
+	for _, c := range cases {
+		if got := QuotaLevel(c.sent, c.limit); got != c.want {
+			t.Errorf("QuotaLevel(%d,%d)=%s want %s", c.sent, c.limit, got, c.want)
+		}
+	}
+}

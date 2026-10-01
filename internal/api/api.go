@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"voiceplan/internal/gcal"
 	"voiceplan/internal/line"
 	"voiceplan/internal/plan"
+	"voiceplan/internal/remind"
 )
 
 type Parser interface {
@@ -57,17 +59,48 @@ type Events interface {
 
 // Contact is a person who can receive LINE reminders.
 type Contact struct {
-	ID     int64  `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"` // pending | active | blocked
-	IsSelf bool   `json:"is_self"`
+	ID      int64  `json:"id"`
+	Name    string `json:"name"`
+	Status  string `json:"status"` // pending | active | blocked ("blocked" is shown as invalid)
+	IsSelf  bool   `json:"is_self"`
+	Enabled bool   `json:"enabled"`
 }
+
+var ErrNotFound = errors.New("not found")
 
 type Contacts interface {
 	List(ctx context.Context, userID int64) ([]Contact, error)
 	EnsureSelf(ctx context.Context, userID int64) (Contact, error)
+	Get(ctx context.Context, userID, id int64) (Contact, error) // ErrNotFound if not the user's
+	Create(ctx context.Context, userID int64, name string) (Contact, error)
+	Update(ctx context.Context, userID, id int64, name *string, enabled *bool) error
+	// Delete removes the contact together with its LINE ID, binding codes and delivery records.
+	Delete(ctx context.Context, userID, id int64) error
 	CreateBindingCode(ctx context.Context, contactID int64, codeHash []byte, expires time.Time) error
 }
+
+type Group struct {
+	ID        int64   `json:"id"`
+	Name      string  `json:"name"`
+	MemberIDs []int64 `json:"member_ids"`
+}
+
+// Groups are only a shortcut for ticking several recipients; unrelated to LINE groups.
+type Groups interface {
+	List(ctx context.Context, userID int64) ([]Group, error)
+	Save(ctx context.Context, userID int64, id int64, name string, memberIDs []int64) (Group, error) // id 0 = create
+	Delete(ctx context.Context, userID, id int64) error
+}
+
+// Usage reports messages pushed in a Taipei month ("2026-10").
+type Usage interface {
+	Month(ctx context.Context, month string) (int, error)
+}
+
+const (
+	maxContacts = 30
+	maxGroups   = 20
+)
 
 type ScheduleReq struct {
 	UserID      int64
@@ -96,15 +129,19 @@ type TipsGenerator interface {
 const bindingCodeTTL = 10 * time.Minute
 
 type Server struct {
-	Contacts    Contacts
-	Reminders   Reminders
-	Tips        TipsGenerator
-	Parser      Parser
-	Transcriber Transcriber
-	Calendar    Calendar
-	Events      Events
-	UserID      func(ctx context.Context) (int64, bool)
-	Now         func() time.Time
+	Groups       Groups
+	Usage        Usage
+	MonthlyLimit int
+	AddFriendURL string
+	Contacts     Contacts
+	Reminders    Reminders
+	Tips         TipsGenerator
+	Parser       Parser
+	Transcriber  Transcriber
+	Calendar     Calendar
+	Events       Events
+	UserID       func(ctx context.Context) (int64, bool)
+	Now          func() time.Time
 }
 
 // Register mounts routes; wrap is the auth middleware.
@@ -117,7 +154,265 @@ func (s *Server) Register(mux *http.ServeMux, wrap func(http.Handler) http.Handl
 	mux.Handle("GET /api/events", h(s.listEvents))
 	mux.Handle("DELETE /api/events/{id}", h(s.deleteEvent))
 	mux.Handle("GET /api/contacts", h(s.listContacts))
+	mux.Handle("POST /api/contacts", h(s.createContact))
+	mux.Handle("PATCH /api/contacts/{id}", h(s.updateContact))
+	mux.Handle("DELETE /api/contacts/{id}", h(s.deleteContact))
+	mux.Handle("POST /api/contacts/{id}/invite", h(s.invite))
 	mux.Handle("POST /api/line/bind", h(s.startBinding))
+	mux.Handle("GET /api/groups", h(s.listGroups))
+	mux.Handle("POST /api/groups", h(s.saveGroup))
+	mux.Handle("PUT /api/groups/{id}", h(s.saveGroup))
+	mux.Handle("DELETE /api/groups/{id}", h(s.deleteGroup))
+	mux.Handle("GET /api/line/usage", h(s.usage))
+}
+
+func pathID(r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	return id, err == nil && id > 0
+}
+
+func validName(s string, max int) (string, bool) {
+	s = strings.TrimSpace(s)
+	n := utf8.RuneCountInString(s)
+	return s, n >= 1 && n <= max
+}
+
+func (s *Server) createContact(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Name string `json:"name"`
+	}
+	if !decode(w, r, 4<<10, &in) {
+		return
+	}
+	name, ok := validName(in.Name, 30)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	existing, err := s.Contacts.List(r.Context(), uid)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if len(existing) >= maxContacts {
+		writeErr(w, http.StatusConflict, "too_many_contacts")
+		return
+	}
+	c, err := s.Contacts.Create(r.Context(), uid, name)
+	if err != nil {
+		log.Printf("create contact: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) updateContact(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid_id")
+		return
+	}
+	var in struct {
+		Name    *string `json:"name"`
+		Enabled *bool   `json:"enabled"`
+	}
+	if !decode(w, r, 4<<10, &in) {
+		return
+	}
+	if in.Name != nil {
+		n, ok := validName(*in.Name, 30)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "invalid_name")
+			return
+		}
+		in.Name = &n
+	}
+	if err := s.Contacts.Update(r.Context(), uid, id, in.Name, in.Enabled); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found")
+			return
+		}
+		log.Printf("update contact: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteContact(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid_id")
+		return
+	}
+	c, err := s.Contacts.Get(r.Context(), uid, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if c.IsSelf {
+		writeErr(w, http.StatusConflict, "cannot_delete_self")
+		return
+	}
+	if err := s.Contacts.Delete(r.Context(), uid, id); err != nil {
+		log.Printf("delete contact: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// invite issues a one-time binding code for a contact and a ready-to-send message.
+func (s *Server) invite(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid_id")
+		return
+	}
+	c, err := s.Contacts.Get(r.Context(), uid, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not_found")
+		return
+	}
+	code, hash, err := line.NewBindingCode()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if err := s.Contacts.CreateBindingCode(r.Context(), c.ID, hash, s.now().Add(bindingCodeTTL)); err != nil {
+		log.Printf("create binding code: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	mins := int(bindingCodeTTL.Minutes())
+	writeJSON(w, 200, map[string]any{
+		"code": code, "expires_in_minutes": mins, "text": InviteText(s.AddFriendURL, code, mins),
+	})
+}
+
+// InviteText is what the owner forwards to a family member.
+func InviteText(addFriendURL, code string, mins int) string {
+	var b strings.Builder
+	b.WriteString("嗨,我想用 LINE 在行程前提醒你。請照下面兩步完成設定:\n")
+	if addFriendURL != "" {
+		fmt.Fprintf(&b, "1. 點這個連結,把官方帳號加為好友:%s\n", addFriendURL)
+	} else {
+		b.WriteString("1. 把我的 LINE 官方帳號加為好友\n")
+	}
+	fmt.Fprintf(&b, "2. 對它傳送這組綁定碼:%s(%d 分鐘內有效,只能用一次)", code, mins)
+	return b.String()
+}
+
+func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	gs, err := s.Groups.List(r.Context(), uid)
+	if err != nil {
+		log.Printf("list groups: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if gs == nil {
+		gs = []Group{}
+	}
+	writeJSON(w, 200, gs)
+}
+
+func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	var id int64
+	if r.Method == http.MethodPut {
+		if id, ok = pathID(r); !ok {
+			writeErr(w, http.StatusBadRequest, "invalid_id")
+			return
+		}
+	}
+	var in struct {
+		Name      string  `json:"name"`
+		MemberIDs []int64 `json:"member_ids"`
+	}
+	if !decode(w, r, 8<<10, &in) {
+		return
+	}
+	name, ok := validName(in.Name, 30)
+	if !ok || len(in.MemberIDs) > maxContacts {
+		writeErr(w, http.StatusBadRequest, "invalid_group")
+		return
+	}
+	if id == 0 {
+		existing, err := s.Groups.List(r.Context(), uid)
+		if err == nil && len(existing) >= maxGroups {
+			writeErr(w, http.StatusConflict, "too_many_groups")
+			return
+		}
+	}
+	g, err := s.Groups.Save(r.Context(), uid, id, name, in.MemberIDs)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found")
+			return
+		}
+		log.Printf("save group: %v", err)
+		writeErr(w, http.StatusConflict, "group_failed") // most likely a duplicate name
+		return
+	}
+	writeJSON(w, 200, g)
+}
+
+func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid_id")
+		return
+	}
+	if err := s.Groups.Delete(r.Context(), uid, id); err != nil {
+		log.Printf("delete group: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.user(w, r); !ok {
+		return
+	}
+	month := s.now().In(plan.Taipei).Format("2006-01")
+	sent, err := s.Usage.Month(r.Context(), month)
+	if err != nil {
+		log.Printf("usage: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"month": month, "sent": sent, "limit": s.MonthlyLimit, "level": remind.QuotaLevel(sent, s.MonthlyLimit),
+	})
 }
 
 func (s *Server) listContacts(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +601,8 @@ type confirmResp struct {
 	// scheduled | none | event_started | failed
 	Reminder     string `json:"reminder,omitempty"`
 	ReminderLate bool   `json:"reminder_late,omitempty"`
+	// Recipients is how many LINE messages this reminder will consume.
+	Recipients int `json:"reminder_recipients,omitempty"`
 }
 
 // confirm is the only path that writes to Google Calendar, and only for an
@@ -368,18 +665,18 @@ func (s *Server) confirm(w http.ResponseWriter, r *http.Request) {
 	row.Status = "active"
 
 	resp := confirmResp{EventRow: row}
-	resp.Reminder, resp.ReminderLate = s.scheduleReminder(r.Context(), uid, row.ID, ev, in.Reminder)
+	resp.Reminder, resp.ReminderLate, resp.Recipients = s.scheduleReminder(r.Context(), uid, row.ID, ev, in.Reminder)
 	writeJSON(w, http.StatusCreated, resp)
 }
 
 // scheduleReminder never fails the confirmation: the calendar event already
 // exists, so a reminder problem is reported to the client instead.
-func (s *Server) scheduleReminder(ctx context.Context, uid, eventID int64, ev plan.Event, in *ReminderInput) (string, bool) {
+func (s *Server) scheduleReminder(ctx context.Context, uid, eventID int64, ev plan.Event, in *ReminderInput) (string, bool, int) {
 	if in == nil || in.LeadMinutes <= 0 || len(in.ContactIDs) == 0 || s.Reminders == nil {
-		return "none", false
+		return "none", false, 0
 	}
-	if in.LeadMinutes > 7*24*60 || len(in.ContactIDs) > 20 {
-		return "failed", false
+	if in.LeadMinutes > 7*24*60 || len(in.ContactIDs) > maxContacts {
+		return "failed", false, 0
 	}
 	now := s.now()
 	tips := ""
@@ -399,9 +696,9 @@ func (s *Server) scheduleReminder(ctx context.Context, uid, eventID int64, ev pl
 	})
 	if err != nil {
 		log.Printf("schedule reminder: %v", err)
-		return "failed", false
+		return "failed", false, 0
 	}
-	return res.Status, res.Late
+	return res.Status, res.Late, res.Recipients
 }
 
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { api, ApiError, CATEGORIES, ERROR_TEXT, LEAD_OPTIONS, type Contact, type EventRow, type ParseResult } from './api'
+import { api, ApiError, CATEGORIES, ERROR_TEXT, LEAD_OPTIONS, type Contact, type EventRow, type Group, type ParseResult, type Usage } from './api'
 import { WavRecorder } from './recorder'
+import ContactsView from './ContactsView.vue'
 
 const props = defineProps<{ email: string; notice: string }>()
 const emit = defineEmits<{ (e: 'logout'): void }>()
@@ -24,16 +25,48 @@ async function loadGoogle() {
 const showConnect = computed(() => google.loaded && (!google.connected || google.needsReauth))
 
 // ---- LINE binding ------------------------------------------------------------
+const view = ref<'plans' | 'contacts'>('plans')
 const contacts = ref<Contact[]>([])
+const groups = ref<Group[]>([])
+const usage = ref<Usage | null>(null)
 const contactsLoaded = ref(false)
 const lineBound = computed(() => contacts.value.some((c) => c.is_self && c.status === 'active'))
 const lineBlocked = computed(() => contacts.value.some((c) => c.is_self && c.status === 'blocked'))
-const activeContacts = computed(() => contacts.value.filter((c) => c.status === 'active'))
+const usageWarn = computed(() => usage.value && usage.value.level !== 'ok')
+const usageText = computed(() => {
+  const u = usage.value
+  if (!u) return ''
+  if (u.level === 'full') return `本月 LINE 額度已用完(${u.sent}/${u.limit}),提醒不會發送,下個月自動恢復。`
+  if (u.level === 'critical') return `本月 LINE 額度快用完了(${u.sent}/${u.limit})。`
+  return `本月 LINE 額度已用 ${u.sent}/${u.limit} 則。`
+})
+const remaining = computed(() => (usage.value && usage.value.limit > 0 ? Math.max(0, usage.value.limit - usage.value.sent) : null))
+const overQuota = computed(() => remaining.value !== null && remindTo.value.length > remaining.value)
+
+// A group chip ticks (or unticks) all of its members who can receive messages.
+function groupMembers(g: Group): number[] {
+  return g.member_ids.filter((id) => activeContacts.value.some((c) => c.id === id))
+}
+const groupOn = (g: Group) => {
+  const m = groupMembers(g)
+  return m.length > 0 && m.every((id) => remindTo.value.includes(id))
+}
+function toggleGroup(g: Group) {
+  const m = groupMembers(g)
+  remindTo.value = groupOn(g)
+    ? remindTo.value.filter((id) => !m.includes(id))
+    : [...new Set([...remindTo.value, ...m])]
+}
+// Only people who can actually receive a message are offered as recipients.
+const activeContacts = computed(() => contacts.value.filter((c) => c.status === 'active' && c.enabled))
 const flash = ref('')
 
 async function loadContacts() {
   try {
-    contacts.value = await api.contacts()
+    const [c, g, u] = await Promise.all([api.contacts(), api.groups(), api.usage()])
+    contacts.value = c
+    groups.value = g
+    usage.value = u
   } catch {
     /* keep previous */
   } finally {
@@ -208,10 +241,10 @@ async function confirm() {
       category: d.category,
       reminder: remindTo.value.length ? { lead_minutes: remindLead.value, contact_ids: remindTo.value } : null,
     })
-    flash.value = reminderNotice(res.reminder, res.reminder_late)
+    flash.value = reminderNotice(res.reminder, res.reminder_late, res.reminder_recipients)
     draft.value = null
     text.value = ''
-    await Promise.all([loadEvents(), loadGoogle()])
+    await Promise.all([loadEvents(), loadGoogle(), loadContacts()])
   } catch (e) {
     if (e instanceof ApiError && (e.code === 'reauth_required' || e.code === 'calendar_not_connected')) {
       google.connected = e.code !== 'calendar_not_connected'
@@ -224,10 +257,11 @@ async function confirm() {
   }
 }
 
-function reminderNotice(status?: string, late?: boolean): string {
+function reminderNotice(status?: string, late?: boolean, n?: number): string {
+  const who = n && n > 1 ? `(${n} 人)` : ''
   switch (status) {
     case 'scheduled':
-      return late ? '已寫入行事曆。提醒時間已過,會立刻發送 LINE 通知。' : '已寫入行事曆,並排定 LINE 提醒。'
+      return late ? `已寫入行事曆。提醒時間已過,會立刻發送 LINE 通知${who}。` : `已寫入行事曆,並排定 LINE 提醒${who}。`
     case 'event_started':
       return '已寫入行事曆。行程已經開始,所以沒有設定提醒。'
     case 'failed':
@@ -276,8 +310,19 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="home">
+  <ContactsView
+    v-if="view === 'contacts'"
+    :contacts="contacts"
+    :groups="groups"
+    :usage="usage"
+    @back="view = 'plans'"
+    @changed="loadContacts"
+  />
+  <div v-else class="home">
     <van-nav-bar title="計畫">
+      <template #left>
+        <van-button size="small" plain @click="view = 'contacts'">聯絡人</van-button>
+      </template>
       <template #right>
         <van-button size="small" plain @click="emit('logout')">登出</van-button>
       </template>
@@ -287,6 +332,10 @@ onMounted(() => {
       <p v-if="props.notice" class="banner ok" role="status">{{ props.notice }}</p>
 
       <p v-if="flash" class="banner ok" role="status">{{ flash }}</p>
+
+      <div v-if="usageWarn" class="banner" :class="usage?.level === 'warn' ? 'line' : 'warn'" role="status">
+        <span>{{ usageText }}</span>
+      </div>
 
       <div v-if="contactsLoaded && !lineBound" class="banner line">
         <template v-if="lineBlocked">
@@ -397,12 +446,27 @@ onMounted(() => {
               </select>
             </label>
             <p class="small">通知誰(預設不通知任何人):</p>
+            <div v-if="groups.some((g) => groupMembers(g).length)" class="chips">
+              <button
+                v-for="g in groups.filter((g) => groupMembers(g).length)"
+                :key="g.id"
+                type="button"
+                class="chip"
+                :class="{ on: groupOn(g) }"
+                :aria-pressed="groupOn(g)"
+                @click="toggleGroup(g)"
+              >{{ g.name }}</button>
+            </div>
             <label v-for="c in activeContacts" :key="c.id" class="check">
               <input v-model="remindTo" type="checkbox" :value="c.id" />
               <span>{{ c.name }}</span>
             </label>
+            <p v-if="remindTo.length" class="small" :class="{ over: overQuota }">
+              這次提醒會用 {{ remindTo.length }} 則 LINE 額度<template v-if="remaining !== null">(本月剩 {{ remaining }} 則)</template>。
+              <template v-if="overQuota">額度不夠,排在後面的人會收不到。</template>
+            </p>
           </template>
-          <p v-else class="small">還沒有綁定 LINE,這筆行程不會有提醒。</p>
+          <p v-else class="small">還沒有可以收到提醒的人。先綁定你的 LINE,或到「聯絡人」邀請家人。</p>
         </fieldset>
 
         <p v-if="error" class="err" role="alert">{{ error }}</p>
@@ -448,6 +512,10 @@ h2 { font-size: 1.05rem; margin: 28px 0 8px; }
 .banner.line { background: color-mix(in srgb, var(--ink) 8%, transparent); display: flex; flex-direction: column; gap: 8px; }
 .code { font-size: 1.6rem; letter-spacing: 0.12em; font-variant-numeric: tabular-nums; user-select: all; }
 .small { font-size: 0.85rem; opacity: 0.7; margin: 0; }
+.small.over { opacity: 1; border-left: 3px solid var(--signal); padding-left: 8px; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+.chip { border: 1px solid color-mix(in srgb, var(--ink) 35%, transparent); background: var(--paper); color: var(--ink); border-radius: 999px; padding: 6px 14px; font: inherit; font-size: 0.9rem; cursor: pointer; }
+.chip.on { background: var(--ink); color: var(--paper); }
 .remind { border: 1px solid color-mix(in srgb, var(--ink) 18%, transparent); border-radius: 10px; margin: 16px 0 0; padding: 4px 12px 10px; }
 .remind legend { font-size: 0.85rem; padding: 0 6px; }
 button.link-btn { border: 0; font: inherit; cursor: pointer; }
