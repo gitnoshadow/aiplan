@@ -587,3 +587,29 @@ func TestSyncNowErrorMapping(t *testing.T) {
 		t.Fatalf("requires login: %d", rec.Code)
 	}
 }
+
+type countingTips struct{ calls int }
+
+func (c *countingTips) Tips(context.Context, plan.Event, time.Time) (string, error) {
+	c.calls++
+	return "・x", nil
+}
+
+func TestPlainReminderCategoryGetsNoTipsCall(t *testing.T) {
+	ct := &countingTips{}
+	rem := &fakeReminders{res: ScheduleResult{Status: "scheduled", Recipients: 1}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, &fakeContacts{}, rem, ct)
+	body := withReminder("req-12345678", 60, 7)
+	body["category"] = "reminder"
+	if rec := do(mux, "POST", "/api/plans/confirm", "application/json", body); rec.Code != 201 || len(rem.reqs) != 1 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if ct.calls != 0 || rem.reqs[0].Tips != "" {
+		t.Fatalf("a plain reminder must not call the model: calls=%d tips=%q", ct.calls, rem.reqs[0].Tips)
+	}
+	body = withReminder("req-87654321", 60, 7) // medical (see validConfirm)
+	do(mux, "POST", "/api/plans/confirm", "application/json", body)
+	if ct.calls != 1 {
+		t.Fatalf("other categories still get tips: %d", ct.calls)
+	}
+}

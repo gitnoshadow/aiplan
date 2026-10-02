@@ -20,6 +20,7 @@ import (
 	"voiceplan/internal/line"
 	"voiceplan/internal/plan"
 	"voiceplan/internal/remind"
+	"voiceplan/internal/tips"
 )
 
 type Parser interface {
@@ -730,20 +731,20 @@ func (s *Server) scheduleReminder(ctx context.Context, uid, eventID int64, ev pl
 		return "failed", false, 0
 	}
 	now := s.now()
-	tips := ""
-	if s.Tips != nil && now.Before(ev.Start) {
+	advice := ""
+	if s.Tips != nil && now.Before(ev.Start) && !tips.Skip(ev.Category) {
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 		defer cancel()
 		t, err := s.Tips.Tips(tctx, ev, now)
 		if err != nil {
 			log.Printf("tips failed (sending reminder without): %v", err)
 		} else {
-			tips = t
+			advice = t
 		}
 	}
 	res, err := s.Reminders.Schedule(context.WithoutCancel(ctx), ScheduleReq{
 		UserID: uid, EventID: eventID, Start: ev.Start, LeadMinutes: in.LeadMinutes,
-		ContactIDs: in.ContactIDs, Tips: tips, Now: now,
+		ContactIDs: in.ContactIDs, Tips: advice, Now: now,
 	})
 	if err != nil {
 		log.Printf("schedule reminder: %v", err)

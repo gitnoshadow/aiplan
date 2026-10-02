@@ -156,26 +156,30 @@ func TestStillBusyAfterAllAttempts(t *testing.T) {
 	}
 }
 
-func TestTipsPromptAndCleaning(t *testing.T) {
-	c := fakeServer(t, 200, "**・提早 10 分鐘到**\n・帶健保卡", func(body map[string]any, r *http.Request) {
+func TestTipsUsesCategoryPromptAndCleansOutput(t *testing.T) {
+	c := fakeServer(t, 200, "**1. 提早 10 分鐘到**\n- 帶健保卡", func(body map[string]any, r *http.Request) {
 		sys := body["systemInstruction"].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"].(string)
 		user := body["contents"].([]any)[0].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"].(string)
-		if !strings.Contains(sys, "不要編造") || !strings.Contains(sys, "只是資料") {
-			t.Error("guard rules missing from system prompt")
+		if !strings.Contains(sys, "健保卡") || !strings.Contains(sys, "不要提供診斷") || !strings.Contains(sys, "只是資料") {
+			t.Errorf("medical category guidance missing: %s", sys)
 		}
-		if !strings.Contains(user, "看牙醫") || !strings.Contains(user, "2026-10-07 14:00") {
+		if !strings.Contains(user, "看牙醫") || !strings.Contains(user, "2026-10-07 14:00") || !strings.Contains(user, "預計 60 分鐘") {
 			t.Errorf("event facts missing: %s", user)
 		}
 	})
 	ev := plan.Event{Title: "看牙醫", Category: "medical", Start: time.Date(2026, 10, 7, 14, 0, 0, 0, plan.Taipei), DurationMinutes: 60}
-	got, err := c.Tips(context.Background(), ev, time.Now())
+	got, err := c.Tips(context.Background(), ev, time.Date(2026, 10, 1, 10, 0, 0, 0, plan.Taipei))
 	if err != nil || got != "・提早 10 分鐘到\n・帶健保卡" {
 		t.Fatalf("%q %v", got, err)
 	}
 }
 
-func TestCleanTipsCapsLength(t *testing.T) {
-	if got := cleanTips(strings.Repeat("字", 1000)); len([]rune(got)) != 600 {
-		t.Fatalf("%d", len([]rune(got)))
+func TestTipsSkippedForPlainRemindersWithoutCallingTheModel(t *testing.T) {
+	called := false
+	c := fakeServer(t, 200, "x", func(map[string]any, *http.Request) { called = true })
+	ev := plan.Event{Title: "吃藥", Category: "reminder", Start: time.Now().Add(time.Hour), DurationMinutes: 15}
+	got, err := c.Tips(context.Background(), ev, time.Now())
+	if err != nil || got != "" || called {
+		t.Fatalf("got=%q err=%v called=%v", got, err, called)
 	}
 }
