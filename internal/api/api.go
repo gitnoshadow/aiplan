@@ -66,6 +66,9 @@ type Contact struct {
 	Status  string `json:"status"` // pending | active | blocked ("blocked" is shown as invalid)
 	IsSelf  bool   `json:"is_self"`
 	Enabled bool   `json:"enabled"`
+	// LineUserID is LINE's opaque id for this person (shown to the owner only,
+	// and only once the contact is bound). Empty until then.
+	LineUserID string `json:"line_user_id,omitempty"`
 }
 
 var ErrNotFound = errors.New("not found")

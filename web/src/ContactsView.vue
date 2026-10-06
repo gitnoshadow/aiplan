@@ -48,6 +48,23 @@ async function remove(c: Contact) {
   try { await api.deleteContact(c.id); emit('changed') } catch (e) { fail(e) }
 }
 
+// ---- LINE userId (shown to the owner only) -------------------------------------
+const revealed = ref<number[]>([])
+const copiedId = ref(0)
+const shortId = (id: string) => (id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id)
+function toggleReveal(id: number) {
+  revealed.value = revealed.value.includes(id) ? revealed.value.filter((x) => x !== id) : [...revealed.value, id]
+}
+async function copyId(c: Contact) {
+  try {
+    await navigator.clipboard.writeText(c.line_user_id ?? '')
+    copiedId.value = c.id
+    window.setTimeout(() => { if (copiedId.value === c.id) copiedId.value = 0 }, 2000)
+  } catch {
+    error.value = '無法自動複製,請按「顯示完整」後長按文字手動複製。'
+  }
+}
+
 // ---- invitation ------------------------------------------------------------
 const invite = reactive({ id: 0, text: '', copied: false })
 let poll: number | undefined
@@ -143,6 +160,12 @@ async function removeGroup(g: Draft) {
               <button type="button" class="t" @click="toggle(c)">{{ c.enabled ? '暫停' : '恢復' }}</button>
               <button v-if="!c.is_self" type="button" class="t danger" @click="remove(c)">刪除</button>
             </div>
+            <p v-if="c.line_user_id" class="uid">
+              <span class="lbl">LINE userId</span>
+              <code>{{ revealed.includes(c.id) ? c.line_user_id : shortId(c.line_user_id) }}</code>
+              <button type="button" class="t" @click="toggleReveal(c.id)">{{ revealed.includes(c.id) ? '收合' : '顯示完整' }}</button>
+              <button type="button" class="t" @click="copyId(c)">{{ copiedId === c.id ? '已複製' : '複製' }}</button>
+            </p>
             <p v-if="c.status === 'blocked'" class="small">對方封鎖了官方帳號或無法接收,請對方解除封鎖後重新綁定。</p>
 
             <div v-if="invite.id === c.id" class="invite">
@@ -215,6 +238,9 @@ h2 { font-size: 1.05rem; margin: 28px 0 8px; }
 .pill:disabled { opacity: 0.45; }
 input, textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 16px; color: var(--ink); background: color-mix(in srgb, var(--ink) 6%, var(--paper)); border: 1px solid color-mix(in srgb, var(--ink) 18%, transparent); border-radius: 10px; padding: 10px 12px; }
 .add { display: flex; gap: 8px; margin-top: 12px; }
+.uid { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin: 6px 0 0; font-size: 0.8rem; }
+.uid .lbl { opacity: 0.6; }
+.uid code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; user-select: all; }
 .invite { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: color-mix(in srgb, var(--ink) 6%, transparent); }
 .invite textarea { resize: none; line-height: 1.6; margin-top: 6px; }
 .ok { margin: 0; font-weight: 600; }

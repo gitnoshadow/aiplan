@@ -1,7 +1,7 @@
 # CLAUDE.md — 語音計畫助理(voice-plan-assistant)
 
 > 給日後要修改這個專案的人(或 Claude Code)看的完整說明。先讀完這份再動手。
-> 最後更新:v0.7.0。專案七個階段全部完成,使用者確認驗收通過。
+> 最後更新:v0.7.1。專案七個階段全部完成,使用者確認驗收通過。
 
 ## 1. 這是什麼
 
@@ -158,7 +158,7 @@ Migration 在每次啟動時自動套用(`db.Migrate`)。**新增 migration 一�
 | `POST /api/plans/confirm` | 確認並寫入 Google + 排提醒 |
 | `POST /api/transcribe` | 語音轉文字 |
 | `GET /api/events`、`DELETE /api/events/{id}` | 列表、刪除(同步刪 Google) |
-| `GET/POST /api/contacts`、`PATCH/DELETE /api/contacts/{id}` | 聯絡人管理(不能刪自己) |
+| `GET/POST /api/contacts`、`PATCH/DELETE /api/contacts/{id}` | 聯絡人管理(不能刪自己)。`GET` 對已綁定者附上 `line_user_id`(只在登入後提供,前端預設遮罩顯示) |
 | `POST /api/contacts/{id}/invite` | 產生綁定碼與可轉傳的邀請文字 |
 | `POST /api/line/bind` | 管理者自己綁定 LINE |
 | `GET/POST /api/groups`、`PUT/DELETE /api/groups/{id}` | 分組 |
@@ -321,6 +321,7 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 | v0.4.1 | — | 畫面底部顯示版號與 commit(使用者要求,用來確認部署成功)。**從這一版起才有 `VERSION` 檔與版號命名** |
 | v0.6.0 | 6 日曆增量同步 | syncToken、改期重排提醒、刪除取消提醒、立即同步 |
 | v0.7.0 | 7 依類別客製注意事項 | `tips.Guides`、依距離開始時間調整、輸出整理、`reminder` 類別不產生 |
+| v0.7.1 | — | 聯絡人頁顯示已綁定者的 LINE userId(遮罩、可展開與複製) |
 
 階段 5(STT 抽象介面)沒有獨立版本:語音輸入在階段 2 就做完,`api.Transcriber` 介面即是原規格的抽象層。
 

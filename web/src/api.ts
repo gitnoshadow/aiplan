@@ -26,6 +26,7 @@ export interface Contact {
   status: 'pending' | 'active' | 'blocked'
   is_self: boolean
   enabled: boolean
+  line_user_id?: string
 }
 
 export interface Group {

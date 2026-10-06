@@ -613,3 +613,25 @@ func TestPlainReminderCategoryGetsNoTipsCall(t *testing.T) {
 		t.Fatalf("other categories still get tips: %d", ct.calls)
 	}
 }
+
+func TestContactListShowsLineUserIDOnlyWhenBound(t *testing.T) {
+	c := &fakeContacts{list: []Contact{
+		{ID: 7, Name: "我自己", Status: "active", IsSelf: true, Enabled: true, LineUserID: "U0123456789abcdef0123456789abcdef"},
+		{ID: 8, Name: "媽媽", Status: "pending", Enabled: true},
+	}}
+	mux := newServerR(fakeParser{}, &fakeCal{}, newMem(), true, c, nil, nil)
+	rec := do(mux, "GET", "/api/contacts", "", nil)
+	var out []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out) != 2 {
+		t.Fatalf("%v %s", err, rec.Body)
+	}
+	if out[0]["line_user_id"] != "U0123456789abcdef0123456789abcdef" {
+		t.Fatalf("bound contact must expose its id: %v", out[0])
+	}
+	if _, present := out[1]["line_user_id"]; present {
+		t.Fatalf("an unbound contact has no id to show: %v", out[1])
+	}
+	if rec := do(newServerR(fakeParser{}, &fakeCal{}, newMem(), false, c, nil, nil), "GET", "/api/contacts", "", nil); rec.Code != 401 || strings.Contains(rec.Body.String(), "U0123") {
+		t.Fatalf("the id must never be served without a login: %d %s", rec.Code, rec.Body)
+	}
+}

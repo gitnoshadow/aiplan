@@ -24,7 +24,7 @@ func NewContacts(pool *pgxpool.Pool) *Contacts { return &Contacts{pool} }
 
 func (c *Contacts) List(ctx context.Context, userID int64) ([]api.Contact, error) {
 	rows, err := c.pool.Query(ctx,
-		`SELECT id, name, status, is_self, enabled FROM contacts WHERE user_id = $1 ORDER BY is_self DESC, id`, userID)
+		`SELECT id, name, status, is_self, enabled, COALESCE(line_user_id, '') FROM contacts WHERE user_id = $1 ORDER BY is_self DESC, id`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -32,7 +32,7 @@ func (c *Contacts) List(ctx context.Context, userID int64) ([]api.Contact, error
 	var out []api.Contact
 	for rows.Next() {
 		var x api.Contact
-		if err := rows.Scan(&x.ID, &x.Name, &x.Status, &x.IsSelf, &x.Enabled); err != nil {
+		if err := rows.Scan(&x.ID, &x.Name, &x.Status, &x.IsSelf, &x.Enabled, &x.LineUserID); err != nil {
 			return nil, err
 		}
 		out = append(out, x)
