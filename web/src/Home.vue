@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { api, ApiError, CATEGORIES, ERROR_TEXT, LEAD_OPTIONS, type Contact, type EventRow, type Group, type ParseResult, type Usage } from './api'
+import { api, ApiError, CATEGORIES, DELIVERY_REASON, DELIVERY_STATUS, ERROR_TEXT, LEAD_OPTIONS, leadLabel, type Contact, type EventRow, type Group, type ParseResult, type Usage } from './api'
 import { WavRecorder } from './recorder'
 import ContactsView from './ContactsView.vue'
 
@@ -545,6 +545,15 @@ onMounted(() => {
             <div>
               <strong>{{ ev.title }}</strong>
               <span class="meta">{{ when(ev.start_time) }} · {{ ev.duration_minutes }} 分鐘<template v-if="ev.location"> · {{ ev.location }}</template></span>
+              <span v-if="!ev.reminders?.length" class="meta none">沒有設定 LINE 提醒</span>
+              <span v-for="g in ev.reminders" :key="g.lead_minutes" class="meta remind-line">
+                提前 {{ leadLabel(g.lead_minutes) }}<template v-if="g.late">(補發)</template> 通知:
+                <template v-for="(r, i) in g.recipients" :key="i">
+                  <template v-if="i">、</template>
+                  <span class="who-r">{{ r.name }}</span>
+                  <em class="st" :class="r.status">{{ DELIVERY_STATUS[r.status] }}<template v-if="r.reason && DELIVERY_REASON[r.reason]">:{{ DELIVERY_REASON[r.reason] }}</template></em>
+                </template>
+              </span>
             </div>
             <button type="button" class="del" :aria-label="`刪除 ${ev.title}`" @click="remove(ev)">刪除</button>
           </li>
@@ -621,6 +630,12 @@ textarea, input, select {
   border-bottom: 1px solid color-mix(in srgb, var(--ink) 12%, transparent); }
 .upcoming strong { display: block; }
 .meta { display: block; font-size: 0.85rem; opacity: 0.7; margin-top: 2px; }
+.meta.none { opacity: 0.5; }
+.remind-line { line-height: 1.7; }
+.who-r { font-weight: 600; }
+.st { font-style: normal; font-size: 0.75rem; margin-left: 4px; padding: 1px 6px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 10%, transparent); }
+.st.sent { background: color-mix(in srgb, #2a9d62 25%, transparent); }
+.st.failed { background: color-mix(in srgb, var(--signal) 25%, transparent); }
 .del { background: none; border: 0; color: var(--ink); opacity: 0.7; text-decoration: underline; font: inherit;
   font-size: 0.85rem; padding: 8px; cursor: pointer; }
 .who { text-align: center; font-size: 0.8rem; opacity: 0.55; margin: 24px 0 0; }

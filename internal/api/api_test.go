@@ -49,6 +49,7 @@ func (f *fakeCal) DeleteEvent(context.Context, int64, string) error  { f.deletes
 func (f *fakeCal) Status(context.Context, int64) (bool, bool, error) { return true, false, nil }
 
 type memEvents struct {
+	list   []EventRow
 	rows   map[int64]*EventRow
 	byReq  map[string]int64
 	nextID int64
@@ -78,7 +79,7 @@ func (m *memEvents) Abandon(_ context.Context, id int64) error {
 	return nil
 }
 func (m *memEvents) List(context.Context, int64, time.Time, int) ([]EventRow, error) {
-	return nil, nil
+	return m.list, nil
 }
 func (m *memEvents) Get(_ context.Context, _ int64, id int64) (EventRow, error) {
 	if r, ok := m.rows[id]; ok {
@@ -633,5 +634,55 @@ func TestContactListShowsLineUserIDOnlyWhenBound(t *testing.T) {
 	}
 	if rec := do(newServerR(fakeParser{}, &fakeCal{}, newMem(), false, c, nil, nil), "GET", "/api/contacts", "", nil); rec.Code != 401 || strings.Contains(rec.Body.String(), "U0123") {
 		t.Fatalf("the id must never be served without a login: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestGroupDeliveries(t *testing.T) {
+	got := GroupDeliveries([]DeliveryInfo{
+		{EventID: 1, LeadMinutes: 1440, Name: "我自己", Status: "sent"},
+		{EventID: 1, LeadMinutes: 60, Name: "我自己", Status: "pending", Late: true},
+		{EventID: 1, LeadMinutes: 60, Name: "媽媽", Status: "sending"},
+		{EventID: 1, LeadMinutes: 60, Name: "爸爸", Status: "failed", Reason: "quota_exceeded"},
+		{EventID: 2, LeadMinutes: 30, Name: "我自己", Status: "sent", Reason: "ignored-for-sent"},
+	})
+	ev1 := got[1]
+	if len(ev1) != 2 || ev1[0].LeadMinutes != 1440 || ev1[1].LeadMinutes != 60 {
+		t.Fatalf("groups by lead time, in order: %+v", ev1)
+	}
+	if !ev1[1].Late || ev1[0].Late {
+		t.Fatalf("late flag belongs to its own group: %+v", ev1)
+	}
+	r := ev1[1].Recipients
+	if len(r) != 3 || r[0].Name != "我自己" || r[1].Status != "pending" || r[2].Reason != "quota_exceeded" {
+		t.Fatalf("%+v", r)
+	}
+	if r := got[2][0].Recipients[0]; r.Reason != "" {
+		t.Fatalf("a reason is only meaningful for failed/skipped: %+v", r)
+	}
+	if len(GroupDeliveries(nil)) != 0 {
+		t.Fatal("no deliveries, no groups")
+	}
+}
+
+func TestEventListIncludesWhoAndHowEarly(t *testing.T) {
+	ev := newMem()
+	ev.list = []EventRow{
+		{ID: 1, Title: "看牙醫", Status: "active", Reminders: []ReminderGroup{
+			{LeadMinutes: 60, Recipients: []Recipient{{Name: "我自己", Status: "pending"}, {Name: "媽媽", Status: "sent"}}},
+		}},
+		{ID: 2, Title: "沒提醒", Status: "active"},
+	}
+	mux := newServer(fakeParser{}, &fakeCal{}, ev, true)
+	rec := do(mux, "GET", "/api/events", "", nil)
+	var out []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out) != 2 {
+		t.Fatalf("%v %s", err, rec.Body)
+	}
+	rem := out[0]["reminders"].([]any)[0].(map[string]any)
+	if rem["lead_minutes"].(float64) != 60 || len(rem["recipients"].([]any)) != 2 {
+		t.Fatalf("%v", rem)
+	}
+	if _, has := out[1]["reminders"]; has {
+		t.Fatal("an event without reminders must not carry the field")
 	}
 }

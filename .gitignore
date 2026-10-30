@@ -3,3 +3,4 @@ web/node_modules/
 web/dist/
 /server
 *.tar.gz
+KEY.txt

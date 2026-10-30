@@ -10,6 +10,18 @@ export interface ParseResult {
   ambiguities: string[]
 }
 
+export interface Recipient {
+  name: string
+  status: 'pending' | 'sent' | 'failed' | 'skipped'
+  reason?: string
+}
+
+export interface ReminderGroup {
+  lead_minutes: number
+  late?: boolean
+  recipients: Recipient[]
+}
+
 export interface EventRow {
   id: number
   title: string
@@ -18,6 +30,29 @@ export interface EventRow {
   location: string
   notes: string
   category: string
+  reminders?: ReminderGroup[]
+}
+
+/** "60" -> "1 小時", "1440" -> "1 天", "45" -> "45 分鐘". */
+export function leadLabel(minutes: number): string {
+  if (minutes >= 1440 && minutes % 1440 === 0) return `${minutes / 1440} 天`
+  if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60} 小時`
+  return `${minutes} 分鐘`
+}
+
+export const DELIVERY_STATUS: Record<string, string> = {
+  pending: '待發送',
+  sent: '已發送',
+  failed: '發送失敗',
+  skipped: '已略過',
+}
+
+export const DELIVERY_REASON: Record<string, string> = {
+  quota_exceeded: '額度不足',
+  contact_disabled: '已暫停',
+  contact_inactive: '對方已失效',
+  event_started: '行程已開始',
+  event_deleted: '行程已刪除',
 }
 
 export interface Contact {

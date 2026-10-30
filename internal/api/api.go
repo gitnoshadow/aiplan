@@ -47,6 +47,58 @@ type EventRow struct {
 	Status          string    `json:"status"`
 	GoogleEventID   string    `json:"-"`
 	StartUTC        time.Time `json:"-"`
+	// Reminders says who will be (or was) notified and how long before. Only
+	// filled in by List, for the "upcoming" screen.
+	Reminders []ReminderGroup `json:"reminders,omitempty"`
+}
+
+// Recipient is one person of a reminder and how that delivery is going.
+type Recipient struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`           // pending | sent | failed | skipped
+	Reason string `json:"reason,omitempty"` // why it failed or was skipped
+}
+
+// ReminderGroup is all recipients that share one lead time.
+type ReminderGroup struct {
+	LeadMinutes int         `json:"lead_minutes"`
+	Late        bool        `json:"late,omitempty"` // the lead time had already passed when it was scheduled
+	Recipients  []Recipient `json:"recipients"`
+}
+
+// DeliveryInfo is one delivery row as read from the database.
+type DeliveryInfo struct {
+	EventID     int64
+	LeadMinutes int
+	Late        bool
+	Name        string
+	Status      string
+	Reason      string
+}
+
+// GroupDeliveries folds delivery rows into per-event reminder groups. Rows must
+// already be ordered (event, lead time, owner first); that order is preserved.
+func GroupDeliveries(ds []DeliveryInfo) map[int64][]ReminderGroup {
+	out := map[int64][]ReminderGroup{}
+	for _, d := range ds {
+		gs := out[d.EventID]
+		if n := len(gs); n == 0 || gs[n-1].LeadMinutes != d.LeadMinutes {
+			gs = append(gs, ReminderGroup{LeadMinutes: d.LeadMinutes})
+		}
+		g := &gs[len(gs)-1]
+		g.Late = g.Late || d.Late
+		status := d.Status
+		if status == "sending" { // in flight: to the user it is still waiting
+			status = "pending"
+		}
+		r := Recipient{Name: d.Name, Status: status}
+		if status == "failed" || status == "skipped" {
+			r.Reason = d.Reason
+		}
+		g.Recipients = append(g.Recipients, r)
+		out[d.EventID] = gs
+	}
+	return out
 }
 
 type Events interface {

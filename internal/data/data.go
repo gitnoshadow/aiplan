@@ -106,14 +106,49 @@ func (e *Events) List(ctx context.Context, userID int64, from time.Time, limit i
 	}
 	defer rows.Close()
 	var out []api.EventRow
+	var ids []int64
 	for rows.Next() {
 		r, err := scan(rows)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
+		ids = append(ids, r.ID)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	// Who gets reminded, how long before, and how each delivery is going.
+	drows, err := e.pool.Query(ctx, `
+		SELECT d.event_id, d.lead_minutes, d.late, c.name, d.status, d.last_error
+		FROM deliveries d JOIN contacts c ON c.id = d.contact_id
+		WHERE d.event_id = ANY($1)
+		ORDER BY d.event_id, d.lead_minutes DESC, c.is_self DESC, c.id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer drows.Close()
+	var ds []api.DeliveryInfo
+	for drows.Next() {
+		var x api.DeliveryInfo
+		if err := drows.Scan(&x.EventID, &x.LeadMinutes, &x.Late, &x.Name, &x.Status, &x.Reason); err != nil {
+			return nil, err
+		}
+		ds = append(ds, x)
+	}
+	if err := drows.Err(); err != nil {
+		return nil, err
+	}
+	grouped := api.GroupDeliveries(ds)
+	for i := range out {
+		out[i].Reminders = grouped[out[i].ID]
+	}
+	return out, nil
 }
 
 func (e *Events) Get(ctx context.Context, userID, id int64) (api.EventRow, error) {
