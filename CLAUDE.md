@@ -1,7 +1,7 @@
 # CLAUDE.md — 語音計畫助理(voice-plan-assistant)
 
 > 給日後要修改這個專案的人(或 Claude Code)看的完整說明。先讀完這份再動手。
-> 最後更新:v0.7.2。專案七個階段全部完成,使用者確認驗收通過。
+> 最後更新:v0.8.0。專案七個階段全部完成,使用者確認驗收通過。
 
 ## 1. 這是什麼
 
@@ -126,6 +126,16 @@ iPhone PWA (Vue 3)  ──HTTPS──►  Go 服務(單一程序,同時提供前
 ### 5.5 語音輸入
 iPhone 主畫面 App 裡 Web Speech API 不可靠,所以改成:**手機端錄音編碼成 16 kHz 單聲道 WAV**(`recorder.ts`,需要在使用者點擊時啟動)→ `POST /api/transcribe`(Content-Type `audio/wav`,上限 4 MB)→ Gemini 轉文字 → 填入輸入框讓使用者先修改再解析。後端的 `api.Transcriber` 介面就是原規格的 STT 抽象層,要換別家服務只需實作這個介面。
 
+### 5.6 編輯行程(v0.8.0)
+`PATCH /api/events/{id}` 一次送「完整的新內容 + 完整的期望提醒」,不是增量:
+1. `plan.ConfirmInput.Validate` 驗證;`Events.Get` 確認屬於本人。
+2. **先** `gcal.UpdateEvent`(PATCH)。Google 拒絕就整個中止,本機不動。空的地點/備註送 `null` 才能清掉(省略欄位會留下舊文字)。404/410 → `ErrEventGone`(行程已在 Google 被刪,請同步)。
+3. 有勾收件人且行程未開始、類別不是 `reminder` → 重新產生行前注意事項(失敗就保留舊的,`Tips=nil`)。
+4. `data.Editor.Apply` 在**單一交易**內:鎖住事件列(與日曆同步共用 `FOR UPDATE`)→ 更新事件 → `remind.Reconcile` 算出要做什麼 → 執行。
+5. 若 Google 成功但本機失敗,回 `partial_update`;下一次日曆同步會把 Google 的版本抄回本機,所以兩邊不會長期分歧。
+
+`remind.Reconcile`(純函式,測試最完整)的規則:**已發送的永不重發**;尚未發送的,被取消勾選或提前時間不同者刪除,保留者移到新時間;先前失敗/略過但仍被勾選者復活;沒有紀錄的新收件人新建;事件已開始則什麼都不排、待發的標略過。
+
 ## 6. 資料模型(migration 0001–0005)
 
 | 表 | 用途 |
@@ -157,7 +167,7 @@ Migration 在每次啟動時自動套用(`db.Migrate`)。**新增 migration 一�
 | `POST /api/plans/parse` | 解析(**不寫入**) |
 | `POST /api/plans/confirm` | 確認並寫入 Google + 排提醒 |
 | `POST /api/transcribe` | 語音轉文字 |
-| `GET /api/events`、`DELETE /api/events/{id}` | 列表(每筆附 `reminders`:提前多久、通知誰、各人發送狀態,由 `api.GroupDeliveries` 組出)、刪除(同步刪 Google) |
+| `GET /api/events`、`PATCH /api/events/{id}`、`DELETE /api/events/{id}` | 列表(每筆附 `reminders`:提前多久、通知誰、各人發送狀態,由 `api.GroupDeliveries` 組出)、編輯(內容 + 提醒,見 5.6)、刪除(同步刪 Google) |
 | `GET/POST /api/contacts`、`PATCH/DELETE /api/contacts/{id}` | 聯絡人管理(不能刪自己)。`GET` 對已綁定者附上 `line_user_id`(只在登入後提供,前端預設遮罩顯示) |
 | `POST /api/contacts/{id}/invite` | 產生綁定碼與可轉傳的邀請文字 |
 | `POST /api/line/bind` | 管理者自己綁定 LINE |
@@ -266,6 +276,8 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 - 真實的 Google / Gemini / LINE 回應,只在使用者的實際環境驗證過。
 - `go.sum` 沒有隨專案提供,Docker 建置時會跑 `go mod tidy`。有 Go 環境時請執行一次並提交。
 
+**型別檢查資料層的小技巧(沒有網路抓 pgx 時):** 建一個暫存模組,把 `internal/` 複製進去,用一個只含 `pgx.Row/Rows/Tx`、`pgxpool.Pool`、`pgconn.CommandTag/PgError` 的假 `github.com/jackc/pgx/v5`(`go.mod` 的 `replace`)當替身,就能對 `internal/data` 做真正的 `go vet`,抓得到型別與介面不符。v0.8.0 起 `internal/data` 用這個方法檢查過,但**仍不是真實資料庫上的測試**,SQL 是否正確只有實際部署才知道。
+
 各版本的驗收清單在 `README.md`。
 
 ## 13. 常見修改配方
@@ -282,6 +294,7 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 | 換額度上限 | `LINE_MONTHLY_LIMIT` |
 | 改同步頻率 | `CALENDAR_SYNC_MINUTES` |
 | 解析規則(怎麼理解「下週三」、模糊處理) | `plan.SystemPrompt` 與 `plan.Normalize` |
+| 改「編輯時提醒怎麼跟著變」的規則 | `internal/remind/reconcile.go` 的 `Reconcile`(先改測試 `reconcile_test.go`),SQL 執行端在 `internal/data/edit.go` |
 | 新增 API 端點 | 在 `internal/api/api.go` 加介面方法與處理函式、在 `Register` 掛路由、`data` 補實作、`main.go` 接線、`api_test.go` 補測試 |
 | 新增資料表/欄位 | 新增 `internal/db/migrations/000N_*.up.sql` 與 `.down.sql` |
 | 換語音辨識服務 | 實作 `api.Transcriber` 介面,在 `main.go` 換掉 `llm` |
@@ -323,6 +336,7 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 | v0.7.0 | 7 依類別客製注意事項 | `tips.Guides`、依距離開始時間調整、輸出整理、`reminder` 類別不產生 |
 | v0.7.1 | — | 聯絡人頁顯示已綁定者的 LINE userId(遮罩、可展開與複製) |
 | v0.7.2 | — | 行程列表顯示「提前多久、通知誰、各人發送狀態」 |
+| v0.8.0 | — | App 內編輯行程:改內容、提前時間、通知對象;`remind.Reconcile`、`gcal.UpdateEvent`、`data.Editor` |
 
 階段 5(STT 抽象介面)沒有獨立版本:語音輸入在階段 2 就做完,`api.Transcriber` 介面即是原規格的抽象層。
 

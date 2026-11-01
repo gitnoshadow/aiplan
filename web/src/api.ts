@@ -11,6 +11,7 @@ export interface ParseResult {
 }
 
 export interface Recipient {
+  contact_id: number
   name: string
   status: 'pending' | 'sent' | 'failed' | 'skipped'
   reason?: string
@@ -143,6 +144,11 @@ export const api = {
     call<{ text: string }>('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav }),
   syncStatus: () => call<SyncStatus>('/api/sync/status'),
   syncNow: () => call<{ updated: number; cancelled: number; status: SyncStatus }>('/api/sync/now', { method: 'POST' }),
+  updateEvent: (id: number, data: Record<string, unknown>) =>
+    call<{ reminder: string; reminder_late?: boolean; reminder_recipients?: number; reminder_already_sent?: number }>(
+      `/api/events/${id}`,
+      json('PATCH', data),
+    ),
   events: () => call<EventRow[]>('/api/events'),
   deleteEvent: (id: number) => call<void>(`/api/events/${id}`, { method: 'DELETE' }),
 }
@@ -168,6 +174,9 @@ export const ERROR_TEXT: Record<string, string> = {
   group_failed: '儲存分組失敗,分組名稱可能重複了。',
   cannot_delete_self: '不能刪除自己。',
   sync_failed: '同步 Google 日曆失敗,請稍後再試。',
+  event_gone: '這個行程在 Google 日曆上已經不存在了,請按「立即同步」更新列表。',
+  partial_update: 'Google 日曆已更新,但這裡儲存失敗。請按「立即同步」讓兩邊一致,再重新修改。',
+  invalid_reminder: '提醒設定有誤,請重新選擇。',
   parse_failed: '解析失敗,請稍後再試,或換個說法。',
   transcribe_failed: '語音辨識失敗,請再試一次,或直接打字。',
   audio_too_short: '錄音太短,請再說一次。',

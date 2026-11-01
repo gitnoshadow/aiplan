@@ -36,6 +36,18 @@ func (fakeTr) Transcribe(_ context.Context, a []byte, mime string) (string, erro
 type fakeCal struct {
 	inserts, deletes int
 	insertErr        error
+	updates          int
+	updateErr        error
+	lastUpdate       plan.Event
+}
+
+func (f *fakeCal) UpdateEvent(_ context.Context, _ int64, _ string, ev plan.Event) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	f.updates++
+	f.lastUpdate = ev
+	return nil
 }
 
 func (f *fakeCal) InsertEvent(context.Context, int64, plan.Event) (string, error) {
@@ -641,7 +653,7 @@ func TestGroupDeliveries(t *testing.T) {
 	got := GroupDeliveries([]DeliveryInfo{
 		{EventID: 1, LeadMinutes: 1440, Name: "我自己", Status: "sent"},
 		{EventID: 1, LeadMinutes: 60, Name: "我自己", Status: "pending", Late: true},
-		{EventID: 1, LeadMinutes: 60, Name: "媽媽", Status: "sending"},
+		{EventID: 1, LeadMinutes: 60, ContactID: 8, Name: "媽媽", Status: "sending"},
 		{EventID: 1, LeadMinutes: 60, Name: "爸爸", Status: "failed", Reason: "quota_exceeded"},
 		{EventID: 2, LeadMinutes: 30, Name: "我自己", Status: "sent", Reason: "ignored-for-sent"},
 	})
@@ -653,7 +665,7 @@ func TestGroupDeliveries(t *testing.T) {
 		t.Fatalf("late flag belongs to its own group: %+v", ev1)
 	}
 	r := ev1[1].Recipients
-	if len(r) != 3 || r[0].Name != "我自己" || r[1].Status != "pending" || r[2].Reason != "quota_exceeded" {
+	if len(r) != 3 || r[0].Name != "我自己" || r[1].Status != "pending" || r[1].ContactID != 8 || r[2].Reason != "quota_exceeded" {
 		t.Fatalf("%+v", r)
 	}
 	if r := got[2][0].Recipients[0]; r.Reason != "" {
@@ -684,5 +696,144 @@ func TestEventListIncludesWhoAndHowEarly(t *testing.T) {
 	}
 	if _, has := out[1]["reminders"]; has {
 		t.Fatal("an event without reminders must not carry the field")
+	}
+}
+
+type fakeEditor struct {
+	reqs []EditReq
+	res  EditResult
+	err  error
+}
+
+func (f *fakeEditor) Apply(_ context.Context, r EditReq) (EditResult, error) {
+	f.reqs = append(f.reqs, r)
+	return f.res, f.err
+}
+
+// editServer wires an event that already exists in "Google" (g-1) and a fake editor.
+func editServer(cal *fakeCal, ed *fakeEditor, tg TipsGenerator, authed bool) (*http.ServeMux, *memEvents) {
+	ev := newMem()
+	ev.rows[1] = &EventRow{ID: 1, Title: "看牙醫", Status: "active", GoogleEventID: "g-1"}
+	mux := newServerR(fakeParser{}, cal, ev, authed, &fakeContacts{}, &fakeReminders{}, tg)
+	// newServerR builds its own Server; rebuild with the editor attached.
+	s := &Server{Editor: ed, Sync: syncFake, Groups: &fakeGroups{}, Usage: fakeUsage{}, Contacts: &fakeContacts{},
+		Reminders: &fakeReminders{}, Tips: tg, Parser: fakeParser{}, Transcriber: fakeTr{}, Calendar: cal, Events: ev,
+		UserID: func(context.Context) (int64, bool) { return 1, authed }, Now: func() time.Time { return fixedNow }}
+	mux = http.NewServeMux()
+	s.Register(mux, func(h http.Handler) http.Handler { return h })
+	return mux, ev
+}
+
+func editBody(reminder any) map[string]any {
+	return map[string]any{"title": "改期看牙醫", "start_time": "2026-10-08T15:00:00+08:00", "duration_minutes": 45,
+		"location": "新診所", "notes": "帶二代健保卡", "category": "medical", "reminder": reminder}
+}
+
+func TestEditUpdatesGoogleThenAppliesEverythingTogether(t *testing.T) {
+	cal, ed := &fakeCal{}, &fakeEditor{res: EditResult{Status: "scheduled", Recipients: 2}}
+	mux, _ := editServer(cal, ed, fakeTips{out: "・帶健保卡"}, true)
+	rec := do(mux, "PATCH", "/api/events/1", "application/json",
+		editBody(map[string]any{"lead_minutes": 30, "contact_ids": []int64{7, 100}}))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"reminder":"scheduled"`) || !strings.Contains(rec.Body.String(), `"reminder_recipients":2`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if cal.updates != 1 || cal.lastUpdate.Title != "改期看牙醫" || cal.lastUpdate.DurationMinutes != 45 || cal.lastUpdate.Location != "新診所" {
+		t.Fatalf("Google must get the new content: %+v", cal.lastUpdate)
+	}
+	if len(ed.reqs) != 1 {
+		t.Fatalf("%d", len(ed.reqs))
+	}
+	q := ed.reqs[0]
+	if q.EventID != 1 || q.Reminder == nil || q.Reminder.LeadMinutes != 30 || len(q.Reminder.ContactIDs) != 2 ||
+		q.Tips == nil || *q.Tips != "・帶健保卡" || q.Event.Notes != "帶二代健保卡" {
+		t.Fatalf("%+v", q)
+	}
+}
+
+func TestEditWithoutRemindersClearsThem(t *testing.T) {
+	for _, body := range []any{nil, map[string]any{"lead_minutes": 60, "contact_ids": []int64{}}, map[string]any{"lead_minutes": 0, "contact_ids": []int64{7}}} {
+		ed := &fakeEditor{res: EditResult{Status: "cleared"}}
+		mux, _ := editServer(&fakeCal{}, ed, fakeTips{out: "x"}, true)
+		rec := do(mux, "PATCH", "/api/events/1", "application/json", editBody(body))
+		if rec.Code != 200 || len(ed.reqs) != 1 || ed.reqs[0].Reminder != nil || ed.reqs[0].Tips != nil {
+			t.Fatalf("%v -> %d %+v", body, rec.Code, ed.reqs)
+		}
+	}
+}
+
+func TestEditRejectsBadInputBeforeTouchingAnything(t *testing.T) {
+	cal, ed := &fakeCal{}, &fakeEditor{}
+	mux, _ := editServer(cal, ed, nil, true)
+	bad := editBody(nil)
+	bad["title"] = ""
+	if rec := do(mux, "PATCH", "/api/events/1", "application/json", bad); rec.Code != 400 {
+		t.Fatalf("blank title: %d", rec.Code)
+	}
+	if rec := do(mux, "PATCH", "/api/events/1", "application/json", editBody(map[string]any{"lead_minutes": 999999, "contact_ids": []int64{7}})); rec.Code != 400 {
+		t.Fatalf("absurd lead: %d", rec.Code)
+	}
+	if rec := do(mux, "PATCH", "/api/events/abc", "application/json", editBody(nil)); rec.Code != 400 {
+		t.Fatalf("bad id: %d", rec.Code)
+	}
+	if cal.updates != 0 || len(ed.reqs) != 0 {
+		t.Fatal("nothing may change for invalid input")
+	}
+}
+
+func TestEditUnknownEventAndLogin(t *testing.T) {
+	cal, ed := &fakeCal{}, &fakeEditor{}
+	mux, _ := editServer(cal, ed, nil, true)
+	if rec := do(mux, "PATCH", "/api/events/99", "application/json", editBody(nil)); rec.Code != 404 || cal.updates != 0 {
+		t.Fatalf("%d", rec.Code)
+	}
+	mux, _ = editServer(cal, ed, nil, false)
+	if rec := do(mux, "PATCH", "/api/events/1", "application/json", editBody(nil)); rec.Code != 401 || cal.updates != 0 {
+		t.Fatalf("%d", rec.Code)
+	}
+}
+
+func TestEditStopsWhenGoogleRefuses(t *testing.T) {
+	for err, want := range map[error]string{
+		gcal.ErrReauthRequired: "reauth_required", gcal.ErrEventGone: "event_gone", errors.New("boom"): "calendar_failed",
+	} {
+		cal, ed := &fakeCal{updateErr: err}, &fakeEditor{}
+		mux, _ := editServer(cal, ed, fakeTips{out: "x"}, true)
+		rec := do(mux, "PATCH", "/api/events/1", "application/json", editBody(map[string]any{"lead_minutes": 60, "contact_ids": []int64{7}}))
+		if !strings.Contains(rec.Body.String(), want) || len(ed.reqs) != 0 {
+			t.Errorf("%v: %d %s (editor calls=%d)", err, rec.Code, rec.Body, len(ed.reqs))
+		}
+	}
+}
+
+func TestEditKeepsStoredAdviceWhenTheModelFails(t *testing.T) {
+	ed := &fakeEditor{res: EditResult{Status: "scheduled", Recipients: 1}}
+	mux, _ := editServer(&fakeCal{}, ed, fakeTips{err: errors.New("llm down")}, true)
+	rec := do(mux, "PATCH", "/api/events/1", "application/json", editBody(map[string]any{"lead_minutes": 60, "contact_ids": []int64{7}}))
+	if rec.Code != 200 || ed.reqs[0].Tips != nil {
+		t.Fatalf("a nil Tips means keep what is stored: %d %+v", rec.Code, ed.reqs)
+	}
+}
+
+func TestEditPlainReminderCategoryAndPastEventsGetNoTipsCall(t *testing.T) {
+	ct := &countingTips{}
+	ed := &fakeEditor{}
+	mux, _ := editServer(&fakeCal{}, ed, ct, true)
+	b := editBody(map[string]any{"lead_minutes": 60, "contact_ids": []int64{7}})
+	b["category"] = "reminder"
+	do(mux, "PATCH", "/api/events/1", "application/json", b)
+	b = editBody(map[string]any{"lead_minutes": 60, "contact_ids": []int64{7}})
+	b["start_time"] = "2026-09-01T09:00:00+08:00" // before the fixed "now"
+	do(mux, "PATCH", "/api/events/1", "application/json", b)
+	if ct.calls != 0 {
+		t.Fatalf("no advice call expected: %d", ct.calls)
+	}
+}
+
+func TestEditLocalFailureAfterGoogleSuccessIsReportedAsPartial(t *testing.T) {
+	cal, ed := &fakeCal{}, &fakeEditor{err: errors.New("db down")}
+	mux, _ := editServer(cal, ed, nil, true)
+	rec := do(mux, "PATCH", "/api/events/1", "application/json", editBody(nil))
+	if rec.Code != 500 || !strings.Contains(rec.Body.String(), "partial_update") || cal.updates != 1 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }

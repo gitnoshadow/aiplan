@@ -125,7 +125,7 @@ func (e *Events) List(ctx context.Context, userID int64, from time.Time, limit i
 
 	// Who gets reminded, how long before, and how each delivery is going.
 	drows, err := e.pool.Query(ctx, `
-		SELECT d.event_id, d.lead_minutes, d.late, c.name, d.status, d.last_error
+		SELECT d.event_id, d.lead_minutes, d.late, c.id, c.name, d.status, d.last_error
 		FROM deliveries d JOIN contacts c ON c.id = d.contact_id
 		WHERE d.event_id = ANY($1)
 		ORDER BY d.event_id, d.lead_minutes DESC, c.is_self DESC, c.id`, ids)
@@ -136,7 +136,7 @@ func (e *Events) List(ctx context.Context, userID int64, from time.Time, limit i
 	var ds []api.DeliveryInfo
 	for drows.Next() {
 		var x api.DeliveryInfo
-		if err := drows.Scan(&x.EventID, &x.LeadMinutes, &x.Late, &x.Name, &x.Status, &x.Reason); err != nil {
+		if err := drows.Scan(&x.EventID, &x.LeadMinutes, &x.Late, &x.ContactID, &x.Name, &x.Status, &x.Reason); err != nil {
 			return nil, err
 		}
 		ds = append(ds, x)

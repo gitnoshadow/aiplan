@@ -309,3 +309,70 @@ func TestSyncWithoutCalendarMeansNotConnected(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func updateServer(t *testing.T, code int, got *map[string]any, method *string, path *string) *Service {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			_, _ = w.Write([]byte(`{"access_token":"AT"}`))
+			return
+		}
+		*method, *path = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(got)
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"id":"evt-1"}`))
+	}))
+	t.Cleanup(srv.Close)
+	enc, _ := crypto.Encrypt(key, []byte("RT"))
+	s := NewService(&memStore{c: &Creds{RefreshTokenEnc: enc, CalendarID: "cal-1"}}, key, "cid", "sec")
+	s.APIBase, s.TokenURL = srv.URL+"/cal", srv.URL+"/token"
+	return s
+}
+
+func TestUpdateEventPatchesAndClearsEmptyFieldsWithNull(t *testing.T) {
+	var body map[string]any
+	var method, path string
+	s := updateServer(t, 200, &body, &method, &path)
+	ev := plan.Event{Title: "改期", Start: time.Date(2026, 10, 8, 9, 0, 0, 0, plan.Taipei), DurationMinutes: 45}
+	if err := s.UpdateEvent(context.Background(), 1, "evt-1", ev); err != nil {
+		t.Fatal(err)
+	}
+	if method != "PATCH" || path != "/cal/calendars/cal-1/events/evt-1" {
+		t.Fatalf("%s %s", method, path)
+	}
+	start := body["start"].(map[string]any)["dateTime"]
+	end := body["end"].(map[string]any)["dateTime"]
+	if body["summary"] != "改期" || start != "2026-10-08T09:00:00+08:00" || end != "2026-10-08T09:45:00+08:00" {
+		t.Fatalf("%v", body)
+	}
+	for _, k := range []string{"location", "description"} {
+		v, present := body[k]
+		if !present || v != nil {
+			t.Errorf("%s must be sent as null so the old text is cleared: present=%v value=%v", k, present, v)
+		}
+	}
+	ev.Location, ev.Notes = "診所", "帶健保卡"
+	if err := s.UpdateEvent(context.Background(), 1, "evt-1", ev); err != nil {
+		t.Fatal(err)
+	}
+	if body["location"] != "診所" || body["description"] != "帶健保卡" {
+		t.Fatalf("%v", body)
+	}
+}
+
+func TestUpdateEventErrorMapping(t *testing.T) {
+	for code, want := range map[int]error{404: ErrEventGone, 410: ErrEventGone, 401: ErrReauthRequired} {
+		var b map[string]any
+		var m, p string
+		s := updateServer(t, code, &b, &m, &p)
+		if err := s.UpdateEvent(context.Background(), 1, "e", plan.Event{Title: "x", Start: time.Now(), DurationMinutes: 5}); !errors.Is(err, want) {
+			t.Errorf("%d: %v", code, err)
+		}
+	}
+	var b map[string]any
+	var m, p string
+	s := updateServer(t, 500, &b, &m, &p)
+	if err := s.UpdateEvent(context.Background(), 1, "e", plan.Event{Title: "x", Start: time.Now(), DurationMinutes: 5}); err == nil || errors.Is(err, ErrEventGone) {
+		t.Fatalf("%v", err)
+	}
+}

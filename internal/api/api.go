@@ -32,6 +32,7 @@ type Transcriber interface {
 type Calendar interface {
 	InsertEvent(ctx context.Context, userID int64, ev plan.Event) (string, error)
 	DeleteEvent(ctx context.Context, userID int64, eventID string) error
+	UpdateEvent(ctx context.Context, userID int64, eventID string, ev plan.Event) error
 	Status(ctx context.Context, userID int64) (connected, needsReauth bool, err error)
 }
 
@@ -54,9 +55,10 @@ type EventRow struct {
 
 // Recipient is one person of a reminder and how that delivery is going.
 type Recipient struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`           // pending | sent | failed | skipped
-	Reason string `json:"reason,omitempty"` // why it failed or was skipped
+	ContactID int64  `json:"contact_id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`           // pending | sent | failed | skipped
+	Reason    string `json:"reason,omitempty"` // why it failed or was skipped
 }
 
 // ReminderGroup is all recipients that share one lead time.
@@ -71,6 +73,7 @@ type DeliveryInfo struct {
 	EventID     int64
 	LeadMinutes int
 	Late        bool
+	ContactID   int64
 	Name        string
 	Status      string
 	Reason      string
@@ -91,7 +94,7 @@ func GroupDeliveries(ds []DeliveryInfo) map[int64][]ReminderGroup {
 		if status == "sending" { // in flight: to the user it is still waiting
 			status = "pending"
 		}
-		r := Recipient{Name: d.Name, Status: status}
+		r := Recipient{ContactID: d.ContactID, Name: d.Name, Status: status}
 		if status == "failed" || status == "skipped" {
 			r.Reason = d.Reason
 		}
@@ -189,9 +192,37 @@ type Sync interface {
 	SyncUser(ctx context.Context, userID int64) (calsync.Stats, error)
 }
 
+// ReminderPlan is the reminder the user wants after an edit.
+type ReminderPlan struct {
+	LeadMinutes int
+	ContactIDs  []int64
+}
+
+// EditReq is a full edit: new event content and the complete desired reminder.
+type EditReq struct {
+	UserID, EventID int64
+	Event           plan.Event
+	Reminder        *ReminderPlan // nil = no reminders
+	Tips            *string       // nil = keep the stored advice
+	Now             time.Time
+}
+
+type EditResult struct {
+	Status      string // scheduled | none | cleared | event_started
+	Recipients  int
+	Late        bool
+	AlreadySent int // wanted recipients who already got this reminder (not resent)
+}
+
+// Editor applies an edit to the event row and its reminders atomically.
+type Editor interface {
+	Apply(ctx context.Context, req EditReq) (EditResult, error)
+}
+
 const bindingCodeTTL = 10 * time.Minute
 
 type Server struct {
+	Editor       Editor
 	Sync         Sync
 	Groups       Groups
 	Usage        Usage
@@ -217,6 +248,7 @@ func (s *Server) Register(mux *http.ServeMux, wrap func(http.Handler) http.Handl
 	mux.Handle("POST /api/transcribe", h(s.transcribe))
 	mux.Handle("GET /api/events", h(s.listEvents))
 	mux.Handle("DELETE /api/events/{id}", h(s.deleteEvent))
+	mux.Handle("PATCH /api/events/{id}", h(s.updateEvent))
 	mux.Handle("GET /api/contacts", h(s.listContacts))
 	mux.Handle("POST /api/contacts", h(s.createContact))
 	mux.Handle("PATCH /api/contacts/{id}", h(s.updateContact))
@@ -857,4 +889,95 @@ func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+type updateReq struct {
+	plan.ConfirmInput
+	Reminder *ReminderInput `json:"reminder"`
+}
+
+// updateEvent edits an event and its reminders. Google is updated first: if it
+// refuses, nothing local changes. If Google succeeds but the local write fails,
+// the next sync copies Google's version back, so the two cannot stay apart.
+func (s *Server) updateEvent(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid_id")
+		return
+	}
+	var in updateReq
+	if !decode(w, r, 32<<10, &in) {
+		return
+	}
+	ev, err := in.ConfirmInput.Validate()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_plan")
+		return
+	}
+	var want *ReminderPlan
+	if in.Reminder != nil {
+		if in.Reminder.LeadMinutes < 0 || in.Reminder.LeadMinutes > 7*24*60 || len(in.Reminder.ContactIDs) > maxContacts {
+			writeErr(w, http.StatusBadRequest, "invalid_reminder")
+			return
+		}
+		if in.Reminder.LeadMinutes > 0 && len(in.Reminder.ContactIDs) > 0 {
+			want = &ReminderPlan{LeadMinutes: in.Reminder.LeadMinutes, ContactIDs: in.Reminder.ContactIDs}
+		}
+	}
+
+	row, err := s.Events.Get(r.Context(), uid, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if row.GoogleEventID != "" {
+		if err := s.Calendar.UpdateEvent(r.Context(), uid, row.GoogleEventID, ev); err != nil {
+			switch {
+			case errors.Is(err, gcal.ErrReauthRequired):
+				writeErr(w, http.StatusConflict, "reauth_required")
+			case errors.Is(err, gcal.ErrNoCredentials):
+				writeErr(w, http.StatusConflict, "calendar_not_connected")
+			case errors.Is(err, gcal.ErrEventGone):
+				writeErr(w, http.StatusConflict, "event_gone")
+			default:
+				log.Printf("update google event: %v", err)
+				writeErr(w, http.StatusBadGateway, "calendar_failed")
+			}
+			return
+		}
+	}
+
+	// Fresh advice for the edited event (it may have a new time, place or category).
+	now := s.now()
+	var advice *string
+	if want != nil && s.Tips != nil && now.Before(ev.Start) && !tips.Skip(ev.Category) {
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 20*time.Second)
+		defer cancel()
+		if t, err := s.Tips.Tips(tctx, ev, now); err != nil {
+			log.Printf("tips failed (keeping the stored advice): %v", err)
+		} else {
+			advice = &t
+		}
+	}
+
+	res, err := s.Editor.Apply(context.WithoutCancel(r.Context()), EditReq{
+		UserID: uid, EventID: id, Event: ev, Reminder: want, Tips: advice, Now: now,
+	})
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found")
+			return
+		}
+		log.Printf("apply edit: %v", err)
+		writeErr(w, http.StatusInternalServerError, "partial_update")
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"reminder": res.Status, "reminder_late": res.Late,
+		"reminder_recipients": res.Recipients, "reminder_already_sent": res.AlreadySent,
+	})
 }

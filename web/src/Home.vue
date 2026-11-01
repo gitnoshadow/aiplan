@@ -41,7 +41,12 @@ const usageText = computed(() => {
   return `本月 LINE 額度已用 ${u.sent}/${u.limit} 則。`
 })
 const remaining = computed(() => (usage.value && usage.value.limit > 0 ? Math.max(0, usage.value.limit - usage.value.sent) : null))
-const overQuota = computed(() => remaining.value !== null && remindTo.value.length > remaining.value)
+// How many LINE messages saving would newly use. When editing, people who were
+// already notified are not messaged again, so only newly added recipients count.
+const quotaNeed = computed(() =>
+  editing.value ? remindTo.value.filter((id) => !originalRecipients.value.includes(id)).length : remindTo.value.length,
+)
+const overQuota = computed(() => remaining.value !== null && quotaNeed.value > remaining.value)
 
 // A group chip ticks (or unticks) all of its members who can receive messages.
 function groupMembers(g: Group): number[] {
@@ -187,8 +192,18 @@ interface Draft {
 const draft = ref<Draft | null>(null)
 const requestId = ref('')
 const saving = ref(false)
+// Edit mode: the event being changed (null = creating a new plan).
+const editing = ref<EventRow | null>(null)
+const originalRecipients = ref<number[]>([])
+const originalStart = ref('')
+const unavailable = ref<string[]>([]) // earlier recipients who can no longer receive messages
 const remindLead = ref(60)
 const remindTo = ref<number[]>([]) // empty by default: sensitive plans never leak by accident
+const leadOptions = computed(() =>
+  LEAD_OPTIONS.some((o) => o.minutes === remindLead.value)
+    ? LEAD_OPTIONS
+    : [...LEAD_OPTIONS, { minutes: remindLead.value, label: `${leadLabel(remindLead.value)}前` }],
+)
 
 const newId = () =>
   crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
@@ -233,8 +248,7 @@ async function confirm() {
   error.value = ''
   saving.value = true
   try {
-    const res = await api.confirm({
-      request_id: requestId.value,
+    const body = {
       title: d.title,
       start_time: `${d.start}:00+08:00`,
       duration_minutes: d.duration,
@@ -242,10 +256,17 @@ async function confirm() {
       notes: d.notes,
       category: d.category,
       reminder: remindTo.value.length ? { lead_minutes: remindLead.value, contact_ids: remindTo.value } : null,
-    })
-    flash.value = reminderNotice(res.reminder, res.reminder_late, res.reminder_recipients)
-    draft.value = null
-    text.value = ''
+    }
+    if (editing.value) {
+      const res = await api.updateEvent(editing.value.id, body)
+      flash.value = editNotice(res, d.start !== originalStart.value)
+      endEdit()
+    } else {
+      const res = await api.confirm({ request_id: requestId.value, ...body })
+      flash.value = reminderNotice(res.reminder, res.reminder_late, res.reminder_recipients)
+      draft.value = null
+      text.value = ''
+    }
     await Promise.all([loadEvents(), loadGoogle(), loadContacts()])
   } catch (e) {
     if (e instanceof ApiError && (e.code === 'reauth_required' || e.code === 'calendar_not_connected')) {
@@ -274,8 +295,66 @@ function reminderNotice(status?: string, late?: boolean, n?: number): string {
 }
 
 function cancelDraft() {
-  draft.value = null
+  if (editing.value) endEdit()
+  else draft.value = null
   error.value = ''
+}
+
+function endEdit() {
+  editing.value = null
+  draft.value = null
+  originalRecipients.value = []
+  unavailable.value = []
+}
+
+// Open an existing event in the same form used for new plans, filled in with
+// its current content, reminder time and recipients.
+function startEdit(ev: EventRow) {
+  error.value = ''
+  flash.value = ''
+  const group = ev.reminders?.[0] // the longest lead time comes first
+  const all = group?.recipients ?? []
+  const usable = new Set(activeContacts.value.map((c) => c.id))
+  editing.value = ev
+  originalStart.value = ev.start_time.slice(0, 16)
+  originalRecipients.value = all.map((r) => r.contact_id)
+  unavailable.value = all.filter((r) => !usable.has(r.contact_id)).map((r) => r.name)
+  remindLead.value = group?.lead_minutes ?? 60
+  remindTo.value = all.map((r) => r.contact_id).filter((id) => usable.has(id))
+  draft.value = {
+    title: ev.title,
+    // The server formats in Asia/Taipei, so the first 16 chars are local wall time.
+    start: ev.start_time.slice(0, 16),
+    duration: ev.duration_minutes,
+    durationIsDefault: false,
+    location: ev.location,
+    notes: ev.notes,
+    category: ev.category,
+    ambiguities: [],
+  }
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function editNotice(
+  res: { reminder: string; reminder_late?: boolean; reminder_recipients?: number; reminder_already_sent?: number },
+  startChanged: boolean,
+): string {
+  let msg = '已儲存修改,Google 日曆也已更新。'
+  switch (res.reminder) {
+    case 'scheduled': {
+      const n = res.reminder_recipients && res.reminder_recipients > 1 ? `(${res.reminder_recipients} 人)` : ''
+      msg += res.reminder_late ? `提醒時間已過,會立刻發送 LINE 通知${n}。` : `LINE 提醒已更新${n}。`
+      break
+    }
+    case 'cleared':
+      msg += '尚未發送的 LINE 提醒已取消。'
+      break
+    case 'event_started':
+      msg += '行程已經開始,所以沒有安排提醒。'
+      break
+  }
+  if (res.reminder_already_sent && startChanged) msg += '已經發出的提醒不會重發。'
+  return msg
 }
 
 // ---- Google Calendar sync --------------------------------------------------
@@ -454,8 +533,8 @@ onMounted(() => {
 
       <!-- Step 2: confirm -->
       <section v-else class="confirm">
-        <h2>確認計畫</h2>
-        <p class="sub">確認無誤才會寫入行事曆。</p>
+        <h2>{{ editing ? '編輯行程' : '確認計畫' }}</h2>
+        <p class="sub">{{ editing ? '儲存後會同步更新 Google 日曆與 LINE 提醒。' : '確認無誤才會寫入行事曆。' }}</p>
 
         <div v-if="draft.ambiguities.length" class="ambig" role="group" aria-label="需要確認的地方">
           <p class="ambig-title">請先確認下列項目,勾選後才能送出</p>
@@ -494,7 +573,7 @@ onMounted(() => {
           <template v-if="activeContacts.length">
             <label class="field">提前多久提醒
               <select v-model.number="remindLead">
-                <option v-for="o in LEAD_OPTIONS" :key="o.minutes" :value="o.minutes">{{ o.label }}</option>
+                <option v-for="o in leadOptions" :key="o.minutes" :value="o.minutes">{{ o.label }}</option>
               </select>
             </label>
             <p class="small">通知誰(預設不通知任何人):</p>
@@ -513,8 +592,18 @@ onMounted(() => {
               <input v-model="remindTo" type="checkbox" :value="c.id" />
               <span>{{ c.name }}</span>
             </label>
+            <p v-if="unavailable.length" class="small over">
+              {{ unavailable.join('、') }} 目前無法接收提醒(已失效或暫停),儲存後不會再通知。
+            </p>
             <p v-if="remindTo.length" class="small" :class="{ over: overQuota }">
-              這次提醒會用 {{ remindTo.length }} 則 LINE 額度<template v-if="remaining !== null">(本月剩 {{ remaining }} 則)</template>。
+              <template v-if="editing">
+                <template v-if="quotaNeed">新增 {{ quotaNeed }} 位,會多用 {{ quotaNeed }} 則 LINE 額度</template>
+                <template v-else>沒有新增收件人,不會多用額度</template>
+                <template v-if="remaining !== null">(本月剩 {{ remaining }} 則)</template>。已經通知過的人不會重發。
+              </template>
+              <template v-else>
+                這次提醒會用 {{ remindTo.length }} 則 LINE 額度<template v-if="remaining !== null">(本月剩 {{ remaining }} 則)</template>。
+              </template>
               <template v-if="overQuota">額度不夠,排在後面的人會收不到。</template>
             </p>
           </template>
@@ -523,9 +612,9 @@ onMounted(() => {
 
         <p v-if="error" class="err" role="alert">{{ error }}</p>
         <div class="actions">
-          <van-button plain round @click="cancelDraft">返回修改</van-button>
+          <van-button plain round @click="cancelDraft">{{ editing ? '取消' : '返回修改' }}</van-button>
           <van-button type="primary" round :loading="saving" :disabled="!canConfirm" @click="confirm">
-            確認並寫入行事曆
+            {{ editing ? '儲存修改' : '確認並寫入行事曆' }}
           </van-button>
         </div>
       </section>
@@ -555,7 +644,10 @@ onMounted(() => {
                 </template>
               </span>
             </div>
-            <button type="button" class="del" :aria-label="`刪除 ${ev.title}`" @click="remove(ev)">刪除</button>
+            <div class="acts">
+              <button type="button" class="del" :aria-label="`編輯 ${ev.title}`" @click="startEdit(ev)">編輯</button>
+              <button type="button" class="del" :aria-label="`刪除 ${ev.title}`" @click="remove(ev)">刪除</button>
+            </div>
           </li>
         </ul>
       </section>
@@ -636,6 +728,7 @@ textarea, input, select {
 .st { font-style: normal; font-size: 0.75rem; margin-left: 4px; padding: 1px 6px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 10%, transparent); }
 .st.sent { background: color-mix(in srgb, #2a9d62 25%, transparent); }
 .st.failed { background: color-mix(in srgb, var(--signal) 25%, transparent); }
+.acts { display: flex; flex-direction: column; align-items: flex-end; flex: none; }
 .del { background: none; border: 0; color: var(--ink); opacity: 0.7; text-decoration: underline; font: inherit;
   font-size: 0.85rem; padding: 8px; cursor: pointer; }
 .who { text-align: center; font-size: 0.8rem; opacity: 0.55; margin: 24px 0 0; }

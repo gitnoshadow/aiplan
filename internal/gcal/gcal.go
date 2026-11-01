@@ -24,6 +24,10 @@ const (
 	DefaultTokenURL = "https://oauth2.googleapis.com/token"
 )
 
+// ErrEventGone means Google no longer has the event (deleted there; the next
+// sync will cancel it locally).
+var ErrEventGone = errors.New("event no longer exists in Google Calendar")
+
 // ErrSyncTokenInvalid means Google no longer honours our syncToken (HTTP 410):
 // the caller must do a full resync.
 var ErrSyncTokenInvalid = errors.New("sync token invalid; full resync required")
@@ -365,4 +369,45 @@ func (s *Service) ListChanges(ctx context.Context, userID int64, syncToken strin
 		return out, resp.NextSyncToken, nil
 	}
 	return nil, "", errors.New("list events: too many pages")
+}
+
+// UpdateEvent changes an existing event. Empty location/description are sent as
+// null, which is how a PATCH clears a field; omitting them would leave the old
+// text in place.
+func (s *Service) UpdateEvent(ctx context.Context, userID int64, eventID string, ev plan.Event) error {
+	calID, err := s.calendarID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	token, _, err := s.accessToken(ctx, userID)
+	if err != nil {
+		return err
+	}
+	nullable := func(v string) any {
+		if v == "" {
+			return nil
+		}
+		return v
+	}
+	body := map[string]any{
+		"summary":     ev.Title,
+		"location":    nullable(ev.Location),
+		"description": nullable(ev.Notes),
+		"start":       map[string]string{"dateTime": ev.Start.In(plan.Taipei).Format(time.RFC3339), "timeZone": plan.TimeZoneName},
+		"end":         map[string]string{"dateTime": ev.End().In(plan.Taipei).Format(time.RFC3339), "timeZone": plan.TimeZoneName},
+	}
+	status, raw, err := s.do(ctx, token, http.MethodPatch,
+		"/calendars/"+url.PathEscape(calID)+"/events/"+url.PathEscape(eventID), body)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case http.StatusOK:
+		return nil
+	case http.StatusNotFound, http.StatusGone:
+		return ErrEventGone
+	case http.StatusUnauthorized:
+		return ErrReauthRequired
+	}
+	return apiErr("update event", status, raw)
 }
