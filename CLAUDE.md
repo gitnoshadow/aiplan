@@ -1,7 +1,7 @@
 # CLAUDE.md — 語音計畫助理(voice-plan-assistant)
 
 > 給日後要修改這個專案的人(或 Claude Code)看的完整說明。先讀完這份再動手。
-> 最後更新:v0.9.0。專案七個階段全部完成,使用者確認驗收通過。
+> 最後更新:v0.9.1。專案七個階段全部完成,使用者確認驗收通過。
 
 ## 1. 這是什麼
 
@@ -254,6 +254,7 @@ Migration 在每次啟動時自動套用(`db.Migrate`)。**新增 migration 一�
 | LINE 每則訊息都多一則自動回覆 | 沒關「自動回應訊息」 |
 | LINE Webhook Verify 失敗 | 在程式部署**之前**就按了。先部署再驗證 |
 | 誤刪 GitHub repo | 本機資料夾還在就重新 `git init` 推上去;Railway 重新連結 repo,**不要刪服務** |
+| 深色模式下按鈕看不清楚(白底淺字) | Vant 的預設/plain 按鈕底色是 `--van-white`,而我們的深色主題把文字改成淺色。要同時覆寫 `--van-button-default-background`、`--van-button-plain-background`、`--van-button-default-color`、`--van-button-default-border-color`(見 `style.css`)。`style.css` 必須在 Vant 樣式**之後**載入才會生效(`main.ts` 的 import 順序) |
 | iPhone 語音辨識不穩 | Web Speech API 在主畫面 App 不可靠,所以改走 WAV 錄音 + Gemini |
 | 移除 Google 第三方存取後無法寫入 | 授權已被撤銷。直接開 `/auth/google/calendar` 重新連結(App 認為已連結時首頁不會出現按鈕) |
 
@@ -303,7 +304,7 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 | 新增 API 端點 | 在 `internal/api/api.go` 加介面方法與處理函式、在 `Register` 掛路由、`data` 補實作、`main.go` 接線、`api_test.go` 補測試 |
 | 新增資料表/欄位 | 新增 `internal/db/migrations/000N_*.up.sql` 與 `.down.sql` |
 | 換語音辨識服務 | 實作 `api.Transcriber` 介面,在 `main.go` 換掉 `llm` |
-| 前端換主題色 | `web/src/style.css` 的 CSS 變數 |
+| 前端換主題色 | `web/src/style.css` 的 CSS 變數。**每新增一種 Vant 元件,都要檢查它在深色模式的底色與字色**:Vant 的預設值是為淺色設計的 |
 
 ## 14. 部署流程
 
@@ -343,6 +344,7 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 | v0.7.2 | — | 行程列表顯示「提前多久、通知誰、各人發送狀態」 |
 | v0.8.0 | — | App 內編輯行程:改內容、提前時間、通知對象;`remind.Reconcile`、`gcal.UpdateEvent`、`data.Editor` |
 | v0.9.0 | — | 提前選項改為 15 分/30 分/1 小時/1 天/2 天(移除 2 小時);新增發送紀錄頁與 `GET /api/deliveries` |
+| v0.9.1 | — | 修正深色模式下次要按鈕(白底淺字)看不清楚;在 `style.css` 補上 Vant 按鈕的主題變數 |
 
 階段 5(STT 抽象介面)沒有獨立版本:語音輸入在階段 2 就做完,`api.Transcriber` 介面即是原規格的抽象層。
 
