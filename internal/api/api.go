@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -219,9 +220,71 @@ type Editor interface {
 	Apply(ctx context.Context, req EditReq) (EditResult, error)
 }
 
+// LogEntry is one line of the delivery log: one message to one person.
+type LogEntry struct {
+	ID          int64     `json:"id"`
+	EventID     int64     `json:"event_id"`
+	EventTitle  string    `json:"event_title"`
+	EventStart  string    `json:"event_start"` // RFC 3339, Asia/Taipei
+	ContactName string    `json:"contact_name"`
+	LeadMinutes int       `json:"lead_minutes"`
+	Status      string    `json:"status"` // pending | sent | failed | skipped
+	Reason      string    `json:"reason,omitempty"`
+	Attempts    int       `json:"attempts"`
+	Late        bool      `json:"late,omitempty"`
+	DueAt       string    `json:"due_at"`
+	SentAt      *string   `json:"sent_at"`
+	DueUTC      time.Time `json:"-"` // for the paging cursor
+}
+
+// LogQuery asks for one page, newest first. Statuses empty = all.
+type LogQuery struct {
+	Statuses  []string
+	Limit     int
+	BeforeDue *time.Time // keyset paging: only rows strictly before (BeforeDue, BeforeID)
+	BeforeID  int64
+}
+
+type DeliveryLog interface {
+	List(ctx context.Context, userID int64, q LogQuery) ([]LogEntry, error)
+}
+
+// logFilters maps the filter names the UI uses to delivery statuses.
+// "pending" includes deliveries currently being sent.
+var logFilters = map[string][]string{
+	"all":     nil,
+	"sent":    {"sent"},
+	"failed":  {"failed"},
+	"skipped": {"skipped"},
+	"pending": {"pending", "sending"},
+}
+
+const (
+	logDefaultLimit = 30
+	logMaxLimit     = 100
+)
+
+// EncodeCursor / DecodeCursor make an opaque "continue after this row" token.
+func EncodeCursor(due time.Time, id int64) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d:%d", due.UTC().UnixMicro(), id)))
+}
+
+func DecodeCursor(s string) (time.Time, int64, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return time.Time{}, 0, errors.New("bad cursor")
+	}
+	var micro, id int64
+	if n, err := fmt.Sscanf(string(raw), "%d:%d", &micro, &id); err != nil || n != 2 || id <= 0 {
+		return time.Time{}, 0, errors.New("bad cursor")
+	}
+	return time.UnixMicro(micro).UTC(), id, nil
+}
+
 const bindingCodeTTL = 10 * time.Minute
 
 type Server struct {
+	Log          DeliveryLog
 	Editor       Editor
 	Sync         Sync
 	Groups       Groups
@@ -249,6 +312,7 @@ func (s *Server) Register(mux *http.ServeMux, wrap func(http.Handler) http.Handl
 	mux.Handle("GET /api/events", h(s.listEvents))
 	mux.Handle("DELETE /api/events/{id}", h(s.deleteEvent))
 	mux.Handle("PATCH /api/events/{id}", h(s.updateEvent))
+	mux.Handle("GET /api/deliveries", h(s.deliveryLog))
 	mux.Handle("GET /api/contacts", h(s.listContacts))
 	mux.Handle("POST /api/contacts", h(s.createContact))
 	mux.Handle("PATCH /api/contacts/{id}", h(s.updateContact))
@@ -980,4 +1044,57 @@ func (s *Server) updateEvent(w http.ResponseWriter, r *http.Request) {
 		"reminder": res.Status, "reminder_late": res.Late,
 		"reminder_recipients": res.Recipients, "reminder_already_sent": res.AlreadySent,
 	})
+}
+
+// deliveryLog serves the "who was sent what, and did it work" history, newest
+// first, a page at a time. Message text is never stored, only the outcome.
+func (s *Server) deliveryLog(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	qs := r.URL.Query()
+	filter := qs.Get("status")
+	if filter == "" {
+		filter = "all"
+	}
+	statuses, known := logFilters[filter]
+	if !known {
+		writeErr(w, http.StatusBadRequest, "invalid_status")
+		return
+	}
+	limit := logDefaultLimit
+	if v := qs.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeErr(w, http.StatusBadRequest, "invalid_limit")
+			return
+		}
+		limit = min(n, logMaxLimit)
+	}
+	q := LogQuery{Statuses: statuses, Limit: limit + 1} // one extra row tells us whether another page exists
+	if c := qs.Get("cursor"); c != "" {
+		due, id, err := DecodeCursor(c)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid_cursor")
+			return
+		}
+		q.BeforeDue, q.BeforeID = &due, id
+	}
+	rows, err := s.Log.List(r.Context(), uid, q)
+	if err != nil {
+		log.Printf("delivery log: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	next := ""
+	if len(rows) > limit {
+		rows = rows[:limit]
+		last := rows[len(rows)-1]
+		next = EncodeCursor(last.DueUTC, last.ID)
+	}
+	if rows == nil {
+		rows = []LogEntry{}
+	}
+	writeJSON(w, 200, map[string]any{"entries": rows, "next_cursor": next})
 }

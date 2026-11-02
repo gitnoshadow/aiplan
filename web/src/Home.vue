@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api, ApiError, CATEGORIES, DELIVERY_REASON, DELIVERY_STATUS, ERROR_TEXT, LEAD_OPTIONS, leadLabel, type Contact, type EventRow, type Group, type ParseResult, type Usage } from './api'
 import { WavRecorder } from './recorder'
 import ContactsView from './ContactsView.vue'
+import LogView from './LogView.vue'
 
 const props = defineProps<{ email: string; notice: string }>()
 const emit = defineEmits<{ (e: 'logout'): void }>()
@@ -25,7 +26,7 @@ async function loadGoogle() {
 const showConnect = computed(() => google.loaded && (!google.connected || google.needsReauth))
 
 // ---- LINE binding ------------------------------------------------------------
-const view = ref<'plans' | 'contacts'>('plans')
+const view = ref<'plans' | 'contacts' | 'log'>('plans')
 const contacts = ref<Contact[]>([])
 const groups = ref<Group[]>([])
 const usage = ref<Usage | null>(null)
@@ -449,10 +450,12 @@ onMounted(() => {
     @back="view = 'plans'"
     @changed="loadContacts"
   />
+  <LogView v-else-if="view === 'log'" :usage="usage" @back="view = 'plans'; loadEvents(); loadContacts()" />
   <div v-else class="home">
     <van-nav-bar title="計畫">
       <template #left>
         <van-button size="small" plain @click="view = 'contacts'">聯絡人</van-button>
+        <van-button size="small" plain class="navgap" @click="view = 'log'">紀錄</van-button>
       </template>
       <template #right>
         <van-button size="small" plain @click="emit('logout')">登出</van-button>
@@ -672,6 +675,7 @@ h2 { font-size: 1.05rem; margin: 28px 0 8px; }
 .code { font-size: 1.6rem; letter-spacing: 0.12em; font-variant-numeric: tabular-nums; user-select: all; }
 .small { font-size: 0.85rem; opacity: 0.7; margin: 0; }
 .small.over { opacity: 1; border-left: 3px solid var(--signal); padding-left: 8px; }
+.navgap { margin-left: 6px; }
 .syncline { margin-bottom: 4px; }
 .t { background: none; border: 0; font: inherit; font-size: 0.85rem; color: var(--ink); text-decoration: underline; padding: 8px 6px; cursor: pointer; }
 .t:disabled { opacity: 0.5; }

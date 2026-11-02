@@ -88,8 +88,8 @@ export const LEAD_OPTIONS: { minutes: number; label: string }[] = [
   { minutes: 15, label: '15 分鐘前' },
   { minutes: 30, label: '30 分鐘前' },
   { minutes: 60, label: '1 小時前(預設)' },
-  { minutes: 120, label: '2 小時前' },
   { minutes: 1440, label: '1 天前' },
+  { minutes: 2880, label: '2 天前' },
 ]
 
 export interface SyncStatus {
@@ -97,6 +97,23 @@ export interface SyncStatus {
   last_error: string
   interval_minutes: number
 }
+
+export interface LogEntry {
+  id: number
+  event_id: number
+  event_title: string
+  event_start: string
+  contact_name: string
+  lead_minutes: number
+  status: 'pending' | 'sent' | 'failed' | 'skipped'
+  reason?: string
+  attempts: number
+  late?: boolean
+  due_at: string
+  sent_at: string | null
+}
+
+export type LogFilter = 'all' | 'sent' | 'failed' | 'pending' | 'skipped'
 
 export class ApiError extends Error {
   constructor(public code: string, public status: number) {
@@ -144,6 +161,10 @@ export const api = {
     call<{ text: string }>('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav }),
   syncStatus: () => call<SyncStatus>('/api/sync/status'),
   syncNow: () => call<{ updated: number; cancelled: number; status: SyncStatus }>('/api/sync/now', { method: 'POST' }),
+  deliveries: (status: LogFilter, cursor: string) =>
+    call<{ entries: LogEntry[]; next_cursor: string }>(
+      `/api/deliveries?status=${status}&limit=30${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
+    ),
   updateEvent: (id: number, data: Record<string, unknown>) =>
     call<{ reminder: string; reminder_late?: boolean; reminder_recipients?: number; reminder_already_sent?: number }>(
       `/api/events/${id}`,

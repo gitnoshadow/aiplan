@@ -837,3 +837,117 @@ func TestEditLocalFailureAfterGoogleSuccessIsReportedAsPartial(t *testing.T) {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }
+
+type fakeLog struct {
+	rows []LogEntry
+	got  []LogQuery
+	err  error
+}
+
+func (f *fakeLog) List(_ context.Context, _ int64, q LogQuery) ([]LogEntry, error) {
+	f.got = append(f.got, q)
+	if f.err != nil {
+		return nil, f.err
+	}
+	n := min(q.Limit, len(f.rows))
+	return f.rows[:n], nil
+}
+
+func logServer(l DeliveryLog, authed bool) *http.ServeMux {
+	s := &Server{Log: l, Events: newMem(), UserID: func(context.Context) (int64, bool) { return 1, authed },
+		Now: func() time.Time { return fixedNow }}
+	mux := http.NewServeMux()
+	s.Register(mux, func(h http.Handler) http.Handler { return h })
+	return mux
+}
+
+func manyEntries(n int) []LogEntry {
+	var out []LogEntry
+	for i := 0; i < n; i++ {
+		out = append(out, LogEntry{ID: int64(100 - i), EventTitle: "e", ContactName: "我自己", Status: "sent",
+			DueUTC: fixedNow.Add(-time.Duration(i) * time.Hour)})
+	}
+	return out
+}
+
+func TestCursorRoundTripAndRejectsGarbage(t *testing.T) {
+	when := time.Date(2026, 10, 7, 5, 59, 59, 123456000, time.UTC)
+	got, id, err := DecodeCursor(EncodeCursor(when, 42))
+	if err != nil || id != 42 || !got.Equal(when) {
+		t.Fatalf("%v %v %v", got, id, err)
+	}
+	for _, bad := range []string{"", "!!!", "bm90LWEtY3Vyc29y", EncodeCursor(when, 0)} {
+		if _, _, err := DecodeCursor(bad); err == nil {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+}
+
+func TestLogPagingFetchesOneExtraRowToKnowIfThereIsMore(t *testing.T) {
+	f := &fakeLog{rows: manyEntries(5)}
+	mux := logServer(f, true)
+	rec := do(mux, "GET", "/api/deliveries?limit=3", "", nil)
+	var out struct {
+		Entries []map[string]any `json:"entries"`
+		Next    string           `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Entries) != 3 || out.Next == "" {
+		t.Fatalf("%v %d %s", err, len(out.Entries), rec.Body)
+	}
+	if f.got[0].Limit != 4 {
+		t.Fatalf("asks for limit+1 rows, got %d", f.got[0].Limit)
+	}
+	// The cursor continues strictly after the last row that was returned.
+	due, id, err := DecodeCursor(out.Next)
+	if err != nil || id != 98 || !due.Equal(f.rows[2].DueUTC) {
+		t.Fatalf("%v %v %v", due, id, err)
+	}
+	do(mux, "GET", "/api/deliveries?limit=3&cursor="+out.Next, "", nil)
+	if q := f.got[1]; q.BeforeDue == nil || q.BeforeID != 98 {
+		t.Fatalf("%+v", q)
+	}
+}
+
+func TestLogLastPageHasNoCursor(t *testing.T) {
+	mux := logServer(&fakeLog{rows: manyEntries(2)}, true)
+	rec := do(mux, "GET", "/api/deliveries?limit=5", "", nil)
+	if !strings.Contains(rec.Body.String(), `"next_cursor":""`) {
+		t.Fatalf("%s", rec.Body)
+	}
+	rec = do(logServer(&fakeLog{}, true), "GET", "/api/deliveries", "", nil)
+	if !strings.Contains(rec.Body.String(), `"entries":[]`) {
+		t.Fatalf("an empty log is an empty list, not null: %s", rec.Body)
+	}
+}
+
+func TestLogFilterAndLimitHandling(t *testing.T) {
+	f := &fakeLog{rows: manyEntries(3)}
+	mux := logServer(f, true)
+	do(mux, "GET", "/api/deliveries?status=pending", "", nil)
+	if got := f.got[0].Statuses; len(got) != 2 || got[0] != "pending" || got[1] != "sending" {
+		t.Fatalf("pending also covers deliveries being sent: %v", got)
+	}
+	do(mux, "GET", "/api/deliveries?status=all", "", nil)
+	if f.got[1].Statuses != nil {
+		t.Fatalf("%v", f.got[1].Statuses)
+	}
+	do(mux, "GET", "/api/deliveries?limit=100000", "", nil)
+	if f.got[2].Limit != logMaxLimit+1 {
+		t.Fatalf("limit must be capped: %d", f.got[2].Limit)
+	}
+	for _, bad := range []string{"status=bogus", "limit=0", "limit=abc", "cursor=%21%21"} {
+		if rec := do(mux, "GET", "/api/deliveries?"+bad, "", nil); rec.Code != 400 {
+			t.Errorf("%s: %d", bad, rec.Code)
+		}
+	}
+}
+
+func TestLogRequiresLoginAndReportsErrors(t *testing.T) {
+	f := &fakeLog{rows: manyEntries(1)}
+	if rec := do(logServer(f, false), "GET", "/api/deliveries", "", nil); rec.Code != 401 || len(f.got) != 0 {
+		t.Fatalf("%d", rec.Code)
+	}
+	if rec := do(logServer(&fakeLog{err: errors.New("db")}, true), "GET", "/api/deliveries", "", nil); rec.Code != 500 {
+		t.Fatalf("%d", rec.Code)
+	}
+}

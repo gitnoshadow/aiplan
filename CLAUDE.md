@@ -1,7 +1,7 @@
 # CLAUDE.md — 語音計畫助理(voice-plan-assistant)
 
 > 給日後要修改這個專案的人(或 Claude Code)看的完整說明。先讀完這份再動手。
-> 最後更新:v0.8.0。專案七個階段全部完成,使用者確認驗收通過。
+> 最後更新:v0.9.0。專案七個階段全部完成,使用者確認驗收通過。
 
 ## 1. 這是什麼
 
@@ -84,6 +84,7 @@ iPhone PWA (Vue 3)  ──HTTPS──►  Go 服務(單一程序,同時提供前
 | `web/src/ContactsView.vue` | 聯絡人、邀請、分組、額度 |
 | `web/src/recorder.ts` | 麥克風錄音 → 16 kHz 單聲道 WAV |
 | `web/src/api.ts` | 後端呼叫與型別、錯誤文字、類別與提醒選項 |
+| `web/src/LogView.vue` | 發送紀錄頁:狀態篩選、載入更多 |
 | `web/src/VersionTag.vue` | 畫面底部版號 + 舊版畫面偵測 |
 | `web/public/privacy.html` | 隱私權政策(Google 發布應用程式需要) |
 
@@ -136,6 +137,9 @@ iPhone 主畫面 App 裡 Web Speech API 不可靠,所以改成:**手機端錄音
 
 `remind.Reconcile`(純函式,測試最完整)的規則:**已發送的永不重發**;尚未發送的,被取消勾選或提前時間不同者刪除,保留者移到新時間;先前失敗/略過但仍被勾選者復活;沒有紀錄的新收件人新建;事件已開始則什麼都不排、待發的標略過。
 
+### 5.7 發送紀錄頁(v0.9.0)
+資料來源就是 `deliveries` 表(每列一則訊息、一位收件人),不另開紀錄表,所以紀錄與實際發送永遠一致。`data.Log.List` 用 `(due_at, id)` 做 **keyset 分頁**(不用 OFFSET,翻頁時新增的列不會造成重複或漏看);API 多取一筆來判斷「還有沒有下一頁」,游標是不透明字串(`api.EncodeCursor`)。訊息內容從不存,只存結果與原因。因為 `deliveries` 隨 `events` 刪除而級聯刪除,**在 App 內刪行程會一併刪掉它的紀錄**;在 Google 刪除的行程只是標 `cancelled`,紀錄保留。前端 `LogView.vue` 用「世代計數」避免快速切換篩選時舊回應蓋掉新回應。
+
 ## 6. 資料模型(migration 0001–0005)
 
 | 表 | 用途 |
@@ -174,6 +178,7 @@ Migration 在每次啟動時自動套用(`db.Migrate`)。**新增 migration 一�
 | `GET/POST /api/groups`、`PUT/DELETE /api/groups/{id}` | 分組 |
 | `GET /api/line/usage` | 本月額度與等級(`ok`/`warn` 80%/`critical` 95%/`full`) |
 | `GET /api/sync/status`、`POST /api/sync/now` | 日曆同步狀態、立即同步 |
+| `GET /api/deliveries?status=&limit=&cursor=` | 發送紀錄(新到舊,keyset 分頁;`status` 為 `all/sent/failed/pending/skipped`,`pending` 含發送中) |
 
 ## 8. 環境變數
 
@@ -288,7 +293,7 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 | 調整行前注意事項的重點/條數/禁忌 | `internal/tips/tips.go` 的 `Guides` 表 |
 | **新增行程類別** | `plan.Categories`、`plan.DefaultDuration`、`tips.Guides`、`tips.labels`、前端 `web/src/api.ts` 的 `CATEGORIES`(測試會檢查前三者同步) |
 | 改提醒訊息的版面 | `internal/remind/remind.go` 的 `Format` |
-| 改「提前多久」選項 / 預設 | 前端 `LEAD_OPTIONS`(`api.ts`);預設值 `remind.DefaultLeadMinutes` 與 `Home.vue` 的 `remindLead` |
+| 改「提前多久」選項 / 預設 | 前端 `LEAD_OPTIONS`(`api.ts`);預設值 `remind.DefaultLeadMinutes` 與 `Home.vue` 的 `remindLead`。後端接受 1 分鐘到 7 天;已建立的舊提前時間編輯時會自動出現在選單裡(`leadOptions`) |
 | 改重試次數與間隔 | `remind.backoff` 與 `remind.MaxAttempts` |
 | 換 LLM 模型 / 備援 | Railway 變數 `LLM_MODEL`、`LLM_FALLBACK_MODEL` |
 | 換額度上限 | `LINE_MONTHLY_LIMIT` |
@@ -337,6 +342,7 @@ cd web && pnpm install && pnpm build   # 含 vue-tsc 型別檢查
 | v0.7.1 | — | 聯絡人頁顯示已綁定者的 LINE userId(遮罩、可展開與複製) |
 | v0.7.2 | — | 行程列表顯示「提前多久、通知誰、各人發送狀態」 |
 | v0.8.0 | — | App 內編輯行程:改內容、提前時間、通知對象;`remind.Reconcile`、`gcal.UpdateEvent`、`data.Editor` |
+| v0.9.0 | — | 提前選項改為 15 分/30 分/1 小時/1 天/2 天(移除 2 小時);新增發送紀錄頁與 `GET /api/deliveries` |
 
 階段 5(STT 抽象介面)沒有獨立版本:語音輸入在階段 2 就做完,`api.Transcriber` 介面即是原規格的抽象層。
 

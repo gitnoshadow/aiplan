@@ -60,6 +60,7 @@ func run() error {
 	syncer := calsync.New(calSvc, data.NewSync(pool), cfg.CalendarSyncEvery)
 	apiSrv := &api.Server{
 		Editor: data.NewEditor(pool),
+		Log:    data.NewLog(pool),
 		Sync:   syncer,
 		Groups: data.NewGroups(pool), Usage: data.NewUsage(pool),
 		MonthlyLimit: cfg.LineMonthlyLimit, AddFriendURL: cfg.LineAddFriendURL,

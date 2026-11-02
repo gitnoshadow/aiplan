@@ -160,3 +160,57 @@ func (e *Events) Delete(ctx context.Context, userID, id int64) error {
 	_, err := e.pool.Exec(ctx, `DELETE FROM events WHERE id = $1 AND user_id = $2`, id, userID)
 	return err
 }
+
+// ---- Delivery log (implements api.DeliveryLog) -------------------------------
+
+type Log struct{ pool *pgxpool.Pool }
+
+func NewLog(pool *pgxpool.Pool) *Log { return &Log{pool} }
+
+// List returns deliveries newest-due first. Paging is keyset-based on
+// (due_at, id), so rows added while the user scrolls cannot shift a page.
+func (l *Log) List(ctx context.Context, userID int64, q api.LogQuery) ([]api.LogEntry, error) {
+	statuses := q.Statuses
+	if statuses == nil {
+		statuses = []string{}
+	}
+	rows, err := l.pool.Query(ctx, `
+		SELECT d.id, d.event_id, e.title, e.start_at, c.name, d.lead_minutes, d.status, d.last_error,
+		       d.attempts, d.late, d.due_at, d.sent_at
+		FROM deliveries d
+		JOIN events e   ON e.id = d.event_id
+		JOIN contacts c ON c.id = d.contact_id
+		WHERE e.user_id = $1
+		  AND (cardinality($2::text[]) = 0 OR d.status = ANY($2::text[]))
+		  AND ($3::timestamptz IS NULL OR (d.due_at, d.id) < ($3::timestamptz, $4::bigint))
+		ORDER BY d.due_at DESC, d.id DESC
+		LIMIT $5`, userID, statuses, q.BeforeDue, q.BeforeID, q.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []api.LogEntry
+	for rows.Next() {
+		var x api.LogEntry
+		var eventStart time.Time
+		var sentAt *time.Time
+		if err := rows.Scan(&x.ID, &x.EventID, &x.EventTitle, &eventStart, &x.ContactName, &x.LeadMinutes,
+			&x.Status, &x.Reason, &x.Attempts, &x.Late, &x.DueUTC, &sentAt); err != nil {
+			return nil, err
+		}
+		x.EventStart = eventStart.In(plan.Taipei).Format(time.RFC3339)
+		x.DueAt = x.DueUTC.In(plan.Taipei).Format(time.RFC3339)
+		if sentAt != nil {
+			s := sentAt.In(plan.Taipei).Format(time.RFC3339)
+			x.SentAt = &s
+		}
+		if x.Status == "sending" {
+			x.Status = "pending"
+		}
+		if x.Status != "failed" && x.Status != "skipped" {
+			x.Reason = ""
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
